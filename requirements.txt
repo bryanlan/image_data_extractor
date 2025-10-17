@@ -1,0 +1,6 @@
+ollama
+PySide6
+pillow
+imagehash
+keyboard
+pywin32
