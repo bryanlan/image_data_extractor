@@ -4,3 +4,6 @@ pillow
 imagehash
 keyboard
 pywin32
+numpy
+python-pptx
+openai
