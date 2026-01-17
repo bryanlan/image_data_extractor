@@ -403,10 +403,36 @@ class AIClient:
         self.ollama_client = Client(host=host, timeout=httpx.Timeout(self.timeout, connect=30.0))
 
     def _init_openai(self):
+        # Clean the URL - OpenAI SDK appends /chat/completions automatically
+        from urllib.parse import urlparse, parse_qs
+        url = self.config.get("url", "")
+
+        # Parse URL to extract query params (like api-version for Azure)
+        parsed = urlparse(url)
+        path = parsed.path
+
+        # Strip trailing /chat/completions if present (user may have copied full URL)
+        for suffix in ["/chat/completions", "/completions"]:
+            if path.endswith(suffix):
+                path = path[:-len(suffix)]
+                break
+
+        # Ensure path doesn't end with /
+        path = path.rstrip("/")
+
+        # Build clean base URL without query params
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+
+        # Extract query params to pass as default_query (for Azure api-version etc.)
+        query_params = parse_qs(parsed.query)
+        # Flatten single-value params
+        default_query = {k: v[0] if len(v) == 1 else v for k, v in query_params.items()}
+
         self.openai_client = OpenAI(
-            base_url=self.config.get("url", ""),
+            base_url=clean_url,
             api_key=self.config.get("api_key", ""),
-            timeout=self.timeout
+            timeout=self.timeout,
+            default_query=default_query if default_query else None
         )
 
     def check_connection(self) -> bool:
@@ -1086,10 +1112,6 @@ class MainWindow(QMainWindow):
 
         self.cfg = load_config()
 
-        # Initialize AI client with selected endpoint
-        self.ai_client: AIClient | None = None
-        self._init_ai_client()
-
         # ---------- State for Mode B ----------
         # If defer_processing=True: store raw PNG bytes to process upon "Complete".
         # If defer_processing=False: process immediately and store HTML sections here.
@@ -1179,25 +1201,23 @@ class MainWindow(QMainWindow):
         self.ai_settings_container = QWidget()
         self.ai_settings_container.setVisible(False)
 
-        # Endpoint selection
-        self.endpoint_combo = QComboBox()
-        self._populate_endpoint_combo()
-        self.endpoint_combo.currentTextChanged.connect(self.on_endpoint_changed)
-        self.btn_manage_endpoints = QPushButton("Manage Endpoints...")
-        self.btn_manage_endpoints.clicked.connect(self.manage_endpoints)
-
-        # Model selection
+        # Model selection (models from all configured endpoints)
         self.model_extract = QComboBox()
-        self.model_extract.setToolTip("Vision model for image extraction")
+        self.model_extract.setToolTip("Vision model for extraction (format: Endpoint: model)")
         self.model_extract.setEditable(True)
         self.model_summary = QComboBox()
-        self.model_summary.setToolTip("Model for summary generation")
+        self.model_summary.setToolTip("Model for summary generation (format: Endpoint: model)")
         self.model_summary.setEditable(True)
-        self.btn_refresh_models = QPushButton("Refresh")
+        self.btn_refresh_models = QPushButton("Refresh Models")
         self.btn_refresh_models.clicked.connect(self.refresh_models)
         self.btn_test_connection = QPushButton("Test")
-        self.btn_test_connection.setToolTip("Test connection using test_image.png")
+        self.btn_test_connection.setToolTip("Test extraction model using test_image.png")
         self.btn_test_connection.clicked.connect(self.test_ai_connection)
+        self.btn_manage_endpoints = QPushButton("Manage Endpoints...")
+        self.btn_manage_endpoints.clicked.connect(self.manage_endpoints)
+        self.btn_cloud_help = QPushButton("Cloud Setup Guide")
+        self.btn_cloud_help.setToolTip("Open guide for setting up Azure AI cloud models")
+        self.btn_cloud_help.clicked.connect(self.open_cloud_help)
 
         # Prompts
         self.prompt_extract = QTextEdit()
@@ -1254,22 +1274,21 @@ class MainWindow(QMainWindow):
         ai_layout = QVBoxLayout(self.ai_settings_container)
         ai_layout.setContentsMargins(20, 5, 5, 10)  # Indent the settings
 
-        # Endpoint row
-        endpoint_row = QHBoxLayout()
-        endpoint_row.addWidget(QLabel("Endpoint:"))
-        endpoint_row.addWidget(self.endpoint_combo, 1)
-        endpoint_row.addWidget(self.btn_manage_endpoints)
-        ai_layout.addLayout(endpoint_row)
+        # Models row (extraction)
+        extract_row = QHBoxLayout()
+        extract_row.addWidget(QLabel("Extraction model:"))
+        extract_row.addWidget(self.model_extract, 1)
+        extract_row.addWidget(self.btn_test_connection)
+        ai_layout.addLayout(extract_row)
 
-        # Models row
-        models_row = QHBoxLayout()
-        models_row.addWidget(QLabel("Extraction:"))
-        models_row.addWidget(self.model_extract, 1)
-        models_row.addWidget(QLabel("Summary:"))
-        models_row.addWidget(self.model_summary, 1)
-        models_row.addWidget(self.btn_refresh_models)
-        models_row.addWidget(self.btn_test_connection)
-        ai_layout.addLayout(models_row)
+        # Models row (summary)
+        summary_row = QHBoxLayout()
+        summary_row.addWidget(QLabel("Summary model:"))
+        summary_row.addWidget(self.model_summary, 1)
+        summary_row.addWidget(self.btn_refresh_models)
+        summary_row.addWidget(self.btn_manage_endpoints)
+        summary_row.addWidget(self.btn_cloud_help)
+        ai_layout.addLayout(summary_row)
 
         # Prompts
         ai_layout.addWidget(QLabel("Extraction prompt:"))
@@ -1348,29 +1367,19 @@ class MainWindow(QMainWindow):
 
     # --------------------------- Endpoint & AI Client helpers ---------------------------
 
-    def _init_ai_client(self):
-        """Initialize the AI client from the selected endpoint configuration."""
-        selected_name = self.cfg.get("selected_endpoint", "Ollama (local)")
-        endpoints = self.cfg.get("endpoints", [DEFAULT_OLLAMA_ENDPOINT])
+    def _get_extraction_client(self) -> tuple[AIClient, str] | None:
+        """Get the AI client and model name for extraction based on current selection."""
+        model_str = self.model_extract.currentText().strip()
+        if not model_str:
+            return None
+        return self._get_client_for_model(model_str)
 
-        # Find the selected endpoint config
-        endpoint_cfg = None
-        for ep in endpoints:
-            if ep.get("name") == selected_name:
-                endpoint_cfg = ep
-                break
-
-        if endpoint_cfg is None and endpoints:
-            endpoint_cfg = endpoints[0]
-
-        if endpoint_cfg is None:
-            endpoint_cfg = DEFAULT_OLLAMA_ENDPOINT
-
-        try:
-            self.ai_client = AIClient(endpoint_cfg)
-        except Exception as e:
-            QMessageBox.warning(self, "AI Client Error", f"Could not initialize AI client:\n{e}")
-            self.ai_client = None
+    def _get_summary_client(self) -> tuple[AIClient, str] | None:
+        """Get the AI client and model name for summary based on current selection."""
+        model_str = self.model_summary.currentText().strip()
+        if not model_str:
+            return None
+        return self._get_client_for_model(model_str)
 
     def _short_folder_path(self) -> str:
         """Return a shortened folder path for display."""
@@ -1379,23 +1388,6 @@ class MainWindow(QMainWindow):
         if len(str(path)) > 50:
             return f".../{path.parent.name}/{path.name}"
         return str(path)
-
-    def _populate_endpoint_combo(self):
-        """Populate the endpoint dropdown from config."""
-        # Block signals to prevent on_endpoint_changed from firing during populate
-        self.endpoint_combo.blockSignals(True)
-        try:
-            self.endpoint_combo.clear()
-            endpoints = self.cfg.get("endpoints", [DEFAULT_OLLAMA_ENDPOINT])
-            for ep in endpoints:
-                self.endpoint_combo.addItem(ep.get("name", "Unknown"))
-            # Select the current endpoint
-            selected = self.cfg.get("selected_endpoint", "Ollama (local)")
-            idx = self.endpoint_combo.findText(selected)
-            if idx >= 0:
-                self.endpoint_combo.setCurrentIndex(idx)
-        finally:
-            self.endpoint_combo.blockSignals(False)
 
     def _toggle_ai_settings(self):
         """Toggle visibility of AI settings panel."""
@@ -1406,18 +1398,53 @@ class MainWindow(QMainWindow):
         else:
             self.btn_toggle_ai.setText("▼ AI Settings")
 
+    def _parse_model_string(self, model_str: str) -> tuple[str, str]:
+        """Parse 'Endpoint: model' string into (endpoint_name, model_name)."""
+        if ": " in model_str:
+            parts = model_str.split(": ", 1)
+            return parts[0], parts[1]
+        # Fallback: assume it's just a model name for Ollama
+        return "Ollama (local)", model_str
+
+    def _get_client_for_model(self, model_str: str) -> tuple[AIClient, str] | None:
+        """Get the appropriate AI client for a model string. Returns (client, model_name) or None."""
+        endpoint_name, model_name = self._parse_model_string(model_str)
+
+        # Find the endpoint config
+        endpoints = self.cfg.get("endpoints", [DEFAULT_OLLAMA_ENDPOINT])
+        endpoint_cfg = None
+        for ep in endpoints:
+            if ep.get("name") == endpoint_name:
+                endpoint_cfg = ep
+                break
+
+        if endpoint_cfg is None:
+            return None
+
+        try:
+            client = AIClient(endpoint_cfg)
+            return client, model_name
+        except Exception:
+            return None
+
     def test_ai_connection(self):
         """Test the AI connection by extracting from test_image.png."""
-        # Check if AI client is initialized
-        if not self.ai_client:
-            QMessageBox.warning(self, "No AI Client", "AI client is not initialized.")
-            return
-
         # Check extraction model is selected
-        extract_model = self.model_extract.currentText().strip()
-        if not extract_model:
+        model_str = self.model_extract.currentText().strip()
+        if not model_str:
             QMessageBox.warning(self, "No Model", "Please select an extraction model first.")
             return
+
+        # Parse model string to get endpoint and model
+        endpoint_name, model_name = self._parse_model_string(model_str)
+
+        # Get client for this model
+        result = self._get_client_for_model(model_str)
+        if result is None:
+            QMessageBox.warning(self, "Invalid Model",
+                f"Could not find endpoint '{endpoint_name}' for model.")
+            return
+        client, model_name = result
 
         # Find test image
         test_image_path = Path(__file__).resolve().parent / "test_image.png"
@@ -1432,13 +1459,13 @@ class MainWindow(QMainWindow):
         # Update UI
         self.btn_test_connection.setEnabled(False)
         self.btn_test_connection.setText("Testing...")
-        self.status_update(f"Testing connection with {extract_model}...")
+        self.status_update(f"Testing {endpoint_name}: {model_name}...")
         QApplication.processEvents()
 
         try:
             # Attempt extraction
-            result = self.ai_client.extract_from_image_path(
-                extract_model, extraction_prompt, str(test_image_path)
+            extracted = client.extract_from_image_path(
+                model_name, extraction_prompt, str(test_image_path)
             )
 
             # Show success dialog with result
@@ -1453,8 +1480,8 @@ class MainWindow(QMainWindow):
             layout = QVBoxLayout(dialog)
 
             # Success header
-            header = QLabel(f"<b>Endpoint:</b> {self.cfg.get('selected_endpoint', 'Unknown')}<br>"
-                          f"<b>Model:</b> {extract_model}<br>"
+            header = QLabel(f"<b>Endpoint:</b> {endpoint_name}<br>"
+                          f"<b>Model:</b> {model_name}<br>"
                           f"<b>Status:</b> <span style='color:green'>SUCCESS</span>")
             header.setTextFormat(Qt.RichText)
             layout.addWidget(header)
@@ -1462,7 +1489,7 @@ class MainWindow(QMainWindow):
             # Result text
             layout.addWidget(QLabel("<b>Extracted content:</b>"))
             result_text = QTextEdit()
-            result_text.setPlainText(result.strip())
+            result_text.setPlainText(extracted.strip())
             result_text.setReadOnly(True)
             layout.addWidget(result_text)
 
@@ -1479,20 +1506,10 @@ class MainWindow(QMainWindow):
             self.status_update("Test failed!")
 
             QMessageBox.critical(self, "Test Failed",
-                f"<b>Endpoint:</b> {self.cfg.get('selected_endpoint', 'Unknown')}<br>"
-                f"<b>Model:</b> {extract_model}<br>"
+                f"<b>Endpoint:</b> {endpoint_name}<br>"
+                f"<b>Model:</b> {model_name}<br>"
                 f"<b>Status:</b> <span style='color:red'>FAILED</span><br><br>"
                 f"<b>Error:</b><br>{str(e)}")
-
-    def on_endpoint_changed(self, endpoint_name: str):
-        """Handle endpoint selection change."""
-        if not endpoint_name:
-            return
-        self.cfg["selected_endpoint"] = endpoint_name
-        save_config(self.cfg)
-        self._init_ai_client()
-        # Refresh models for the new endpoint
-        self.refresh_models()
 
     def manage_endpoints(self):
         """Open the endpoint management dialog."""
@@ -1502,10 +1519,14 @@ class MainWindow(QMainWindow):
             # Update config with modified endpoints
             self.cfg["endpoints"] = dialog.get_endpoints()
             save_config(self.cfg)
-            # Refresh the combo and reinitialize client
-            self._populate_endpoint_combo()
-            self._init_ai_client()
+            # Refresh models from all endpoints
             self.refresh_models()
+
+    def open_cloud_help(self):
+        """Open the cloud setup guide in the default browser."""
+        import webbrowser
+        url = "https://microsoft.sharepoint.com/:w:/r/teams/coreos/Shared%20Documents/Core%20OS%20AI%20Pioneers/AI%20Pioneers%20Guides/Use%20Azure%20AI%20Foundry%20to%20access%20Chat%20GPT%205%20with%20MSFT%20data.docx?d=wc6e862e1b0b6469296732594e2ab8574&csf=1&web=1&e=dcfLky"
+        webbrowser.open(url)
 
     def _process_images_with_crop_dialog(self, image_files: list[Path]) -> list[Image.Image] | None:
         """
@@ -1761,27 +1782,56 @@ class MainWindow(QMainWindow):
     # --------------------------- Models ---------------------------
 
     def refresh_models(self):
-        if not self.ai_client:
-            QMessageBox.warning(self, "No AI Client", "AI client is not initialized. Check your endpoint configuration.")
+        """Fetch models from all configured endpoints and populate dropdowns."""
+        endpoints = self.cfg.get("endpoints", [DEFAULT_OLLAMA_ENDPOINT])
+        all_models = []
+        errors = []
+
+        self.status_update("Refreshing models from all endpoints...")
+        QApplication.processEvents()
+
+        for ep in endpoints:
+            endpoint_name = ep.get("name", "Unknown")
+            try:
+                client = AIClient(ep)
+                models = client.list_models()
+                # Prefix each model with endpoint name
+                for model in models:
+                    all_models.append(f"{endpoint_name}: {model}")
+            except Exception as e:
+                errors.append(f"{endpoint_name}: {e}")
+
+        if not all_models and errors:
+            QMessageBox.warning(self, "No Models Found",
+                "Could not fetch models from any endpoint:\n\n" + "\n".join(errors))
+            self.status_update("Failed to refresh models.")
             return
-        try:
-            models = self.ai_client.list_models()
-        except Exception as e:
-            endpoint_name = self.cfg.get("selected_endpoint", "Unknown")
-            QMessageBox.critical(self, "Connection Error", f"Failed to list models from '{endpoint_name}'.\n\n{e}")
-            return
+
+        # Save current selections
         old_extract = self.model_extract.currentText()
         old_summary = self.model_summary.currentText()
+
+        # Update dropdowns
         self.model_extract.clear()
         self.model_summary.clear()
-        self.model_extract.addItems(models)
-        self.model_summary.addItems(models)
+        self.model_extract.addItems(all_models)
+        self.model_summary.addItems(all_models)
+
+        # Restore selections if possible
         if old_extract:
             i = self.model_extract.findText(old_extract)
-            if i >= 0: self.model_extract.setCurrentIndex(i)
+            if i >= 0:
+                self.model_extract.setCurrentIndex(i)
         if old_summary:
             i = self.model_summary.findText(old_summary)
-            if i >= 0: self.model_summary.setCurrentIndex(i)
+            if i >= 0:
+                self.model_summary.setCurrentIndex(i)
+
+        # Show status
+        if errors:
+            self.status_update(f"Loaded {len(all_models)} models. Some endpoints failed.")
+        else:
+            self.status_update(f"Loaded {len(all_models)} models from {len(endpoints)} endpoint(s).")
 
     # --------------------------- Mode A ---------------------------
 
@@ -1803,11 +1853,19 @@ class MainWindow(QMainWindow):
 
         files.sort(key=lambda p: os.path.getctime(p))
 
-        extract_model = self.model_extract.currentText().strip()
-        summary_model = self.model_summary.currentText().strip()
-        if not extract_model or not summary_model:
-            QMessageBox.warning(self, "Models required", "Pick both extraction and summary models.")
+        # Get extraction client and model
+        extract_result = self._get_extraction_client()
+        if not extract_result:
+            QMessageBox.warning(self, "No Extraction Model", "Please select an extraction model.")
             return
+        extract_client, extract_model = extract_result
+
+        # Get summary model (use extraction client for both - they should use same endpoint)
+        summary_model_str = self.model_summary.currentText().strip()
+        if not summary_model_str:
+            QMessageBox.warning(self, "No Summary Model", "Please select a summary model.")
+            return
+        _, summary_model = self._parse_model_string(summary_model_str)
 
         extraction_prompt = self.prompt_extract.toPlainText().strip() or DEFAULT_EXTRACTION_PROMPT
         summary_prompt = self.prompt_summary.toPlainText().strip() or DEFAULT_SUMMARY_PROMPT
@@ -1821,7 +1879,7 @@ class MainWindow(QMainWindow):
 
         self.worker = ProcessingWorker(self)
         self.worker.setup_extract_images(
-            self.ai_client, files, extract_model, extraction_prompt,
+            extract_client, files, extract_model, extraction_prompt,
             summary_model, summary_prompt, include_summary, image_type="path"
         )
         self.worker.progress.connect(self._on_worker_progress)
@@ -2038,10 +2096,11 @@ class MainWindow(QMainWindow):
             fname = None
         self.flash_ping("Captured frame")
 
-        extract_model = self.model_extract.currentText().strip()
-        if not extract_model:
+        extract_result = self._get_extraction_client()
+        if not extract_result:
             QMessageBox.warning(self, "Extraction model needed", "Pick an extraction model first.")
             return
+        extract_client, extract_model = extract_result
 
         extraction_prompt = self.prompt_extract.toPlainText().strip() or DEFAULT_EXTRACTION_PROMPT
 
@@ -2065,7 +2124,7 @@ class MainWindow(QMainWindow):
             self.progress_start(f"Extracting captured frame with {extract_model}...")
 
             self.worker = ProcessingWorker(self)
-            self.worker.setup_extract_single(self.ai_client, png_bytes, extract_model, extraction_prompt, when)
+            self.worker.setup_extract_single(extract_client, png_bytes, extract_model, extraction_prompt, when)
             self.worker.status.connect(self._on_worker_status)
             self.worker.finished_ok.connect(self._on_immediate_finished)
             self.worker.finished_error.connect(self._on_worker_error)
@@ -2085,15 +2144,19 @@ class MainWindow(QMainWindow):
 
     def complete_and_save(self):
         """Process any queued frames (if deferred), then summarize ALL processed sections and save."""
-        summary_model = self.model_summary.currentText().strip()
-        if not summary_model:
-            QMessageBox.warning(self, "Summary model needed", "Pick a summary model to finalize.")
-            return
-
-        extract_model = self.model_extract.currentText().strip()
-        if not extract_model:
+        # Get extraction client and model
+        extract_result = self._get_extraction_client()
+        if not extract_result:
             QMessageBox.warning(self, "Extraction model needed", "Pick an extraction model.")
             return
+        extract_client, extract_model = extract_result
+
+        # Get summary model (parse the model name)
+        summary_model_str = self.model_summary.currentText().strip()
+        if not summary_model_str:
+            QMessageBox.warning(self, "Summary model needed", "Pick a summary model to finalize.")
+            return
+        _, summary_model = self._parse_model_string(summary_model_str)
 
         summary_prompt = self.prompt_summary.toPlainText().strip() or DEFAULT_SUMMARY_PROMPT
         extraction_prompt = self.prompt_extract.toPlainText().strip() or DEFAULT_EXTRACTION_PROMPT
@@ -2118,7 +2181,7 @@ class MainWindow(QMainWindow):
 
             self.worker = ProcessingWorker(self)
             self.worker.setup_extract_images(
-                self.ai_client, list(self.deferred_queue), extract_model, extraction_prompt,
+                extract_client, list(self.deferred_queue), extract_model, extraction_prompt,
                 summary_model, summary_prompt, include_summary, image_type="bytes"
             )
             self.worker.progress.connect(self._on_worker_progress)
@@ -2128,9 +2191,9 @@ class MainWindow(QMainWindow):
             self.worker.start()
         else:
             # No queued frames, but we have processed sections - just need summary
-            self._finalize_mode_b_with_existing_sections(include_summary, summary_model, summary_prompt)
+            self._finalize_mode_b_with_existing_sections(include_summary, extract_client, summary_model, summary_prompt)
 
-    def _finalize_mode_b_with_existing_sections(self, include_summary: bool, summary_model: str, summary_prompt: str):
+    def _finalize_mode_b_with_existing_sections(self, include_summary: bool, client: AIClient, summary_model: str, summary_prompt: str):
         """Finalize Mode B when we already have processed sections (no queued frames)."""
         if not self.processed_sections_html:
             QMessageBox.information(self, "Nothing to do", "No frames have been processed yet.")
@@ -2145,7 +2208,7 @@ class MainWindow(QMainWindow):
             self.worker = ProcessingWorker(self)
             # Use a simplified approach: setup for summary generation only
             self.worker.setup_extract_images(
-                self.ai_client, [], "", "",  # No images to extract
+                client, [], "", "",  # No images to extract
                 summary_model, summary_prompt, True, image_type="path"
             )
             # Override with direct summary call by using the finished signal creatively
@@ -2189,19 +2252,20 @@ class MainWindow(QMainWindow):
 
     def _start_rename_folder(self, content: str, final_html: str):
         """Start folder rename operation."""
-        summary_model = self.model_summary.currentText().strip()
-        if not self.current_session_folder or not summary_model:
+        result = self._get_summary_client()
+        if not self.current_session_folder or result is None:
             # Skip rename, just save
             self.save_word_html_via_dialog(final_html)
             self._cleanup_mode_b()
             return
 
+        client, model_name = result
         self._pending_html = final_html
         self._pending_operation = "rename"
         self.progress_start("Generating folder name...", cancellable=False)
 
         self.worker = ProcessingWorker(self)
-        self.worker.setup_rename_folder(self.ai_client, summary_model, content, self.current_session_folder)
+        self.worker.setup_rename_folder(client, model_name, content, self.current_session_folder)
         self.worker.status.connect(self._on_worker_status)
         self.worker.finished_ok.connect(self._on_rename_finished)
         self.worker.finished_error.connect(self._on_rename_error)

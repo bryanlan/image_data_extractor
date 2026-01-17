@@ -19,6 +19,9 @@ Thumbs.db
 # Application config (should not be committed)
 config.json
 
+# Test image (may contain sensitive content)
+test_image.png
+
 # Optional: local interim exports
 *.doc
 *.html
