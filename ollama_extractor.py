@@ -25,6 +25,7 @@ import sys
 import json
 import base64
 import re
+import shutil
 import traceback
 from pathlib import Path
 from datetime import datetime
@@ -1979,6 +1980,97 @@ class MainWindow(QMainWindow):
             return
 
         files.sort(key=lambda p: os.path.getctime(p))
+        file_paths = [Path(f) for f in files]
+
+        # Ask for project folder to save processed images
+        project_folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Project Folder (where to save processed images)",
+            str(Path.home() / "Documents")
+        )
+        if not project_folder:
+            return
+        project_folder = Path(project_folder)
+
+        # Create raw_images subfolder for originals
+        raw_folder = project_folder / "raw_images"
+        raw_folder.mkdir(parents=True, exist_ok=True)
+
+        # Show crop dialog for first image
+        first_img = Image.open(file_paths[0])
+        width, height = first_img.size
+        suggested_crop = get_fallback_teams_crop(first_img, right_percent=30, top_percent=8)
+        dialog = CropPreviewDialog(first_img, suggested_crop, self, total_images=len(file_paths))
+        dialog.setWindowTitle(f"Adjust Crop (1 of {len(file_paths)} images)")
+
+        result = dialog.exec()
+        if result == QDialog.Rejected:
+            return
+
+        crop_mode = dialog.get_crop_mode()  # "none", "all", or "each"
+        crop_percentages = None  # (left_pct, top_pct, right_pct, bottom_pct)
+
+        if crop_mode == "all":
+            crop_box = dialog.get_crop_region()
+            crop_percentages = (
+                crop_box[0] / width,
+                crop_box[1] / height,
+                crop_box[2] / width,
+                crop_box[3] / height
+            )
+        elif crop_mode == "none":
+            crop_percentages = (0.0, 0.0, 1.0, 1.0)
+
+        # Process images: copy originals to raw_images, save cropped to main folder
+        cropped_paths = []
+        self.status_update(f"Processing {len(file_paths)} images...")
+        QApplication.processEvents()
+
+        for i, img_path in enumerate(file_paths):
+            self.status_update(f"Processing image {i+1}/{len(file_paths)}: {img_path.name}")
+            QApplication.processEvents()
+
+            try:
+                # Copy original to raw_images folder
+                raw_dest = raw_folder / img_path.name
+                shutil.copy2(img_path, raw_dest)
+
+                # Open and crop image
+                img = Image.open(img_path)
+                w, h = img.size
+
+                if crop_mode == "each":
+                    # Show dialog for each image
+                    suggested = get_fallback_teams_crop(img, right_percent=30, top_percent=8)
+                    each_dialog = CropPreviewDialog(img, suggested, self, total_images=1)
+                    each_dialog.setWindowTitle(f"Adjust Crop ({i+1} of {len(file_paths)} images)")
+                    if each_dialog.exec() == QDialog.Accepted:
+                        each_mode = each_dialog.get_crop_mode()
+                        if each_mode != "none":
+                            crop_box = each_dialog.get_crop_region()
+                            img = img.crop(crop_box)
+                elif crop_percentages and crop_percentages != (0.0, 0.0, 1.0, 1.0):
+                    left_pct, top_pct, right_pct, bottom_pct = crop_percentages
+                    crop_box = (
+                        int(w * left_pct),
+                        int(h * top_pct),
+                        int(w * right_pct),
+                        int(h * bottom_pct)
+                    )
+                    img = img.crop(crop_box)
+
+                # Save cropped image to main project folder
+                cropped_dest = project_folder / f"cropped_{img_path.name}"
+                img.save(cropped_dest, format="PNG")
+                cropped_paths.append(str(cropped_dest))
+
+            except Exception as e:
+                QMessageBox.warning(self, "Image error", f"Could not process {img_path.name}:\n{e}")
+                continue
+
+        if not cropped_paths:
+            QMessageBox.warning(self, "No images", "No images were processed successfully.")
+            return
 
         # Get extraction client and model
         extract_result = self._get_extraction_client()
@@ -1987,7 +2079,7 @@ class MainWindow(QMainWindow):
             return
         extract_client, extract_model = extract_result
 
-        # Get summary model (use extraction client for both - they should use same endpoint)
+        # Get summary model
         summary_model_str = self.model_summary.currentText().strip()
         if not summary_model_str:
             QMessageBox.warning(self, "No Summary Model", "Please select a summary model.")
@@ -1997,16 +2089,17 @@ class MainWindow(QMainWindow):
         extraction_prompt = self.prompt_extract.toPlainText().strip() or DEFAULT_EXTRACTION_PROMPT
         summary_prompt = self.prompt_summary.toPlainText().strip() or DEFAULT_SUMMARY_PROMPT
         include_summary = self.include_summary_checkbox.isChecked()
-        total_steps = len(files) + (1 if include_summary else 0)
+        total_steps = len(cropped_paths) + (1 if include_summary else 0)
 
-        # Start background worker
+        # Start background worker with cropped images
         self._pending_operation = "mode_a"
-        self.progress_start(f"Processing {len(files)} images...", total_steps)
-        self.status_update(f"Processing {len(files)} images…")
+        self._mode_a_project_folder = project_folder  # Save for later use
+        self.progress_start(f"Extracting from {len(cropped_paths)} images...", total_steps)
+        self.status_update(f"Extracting from {len(cropped_paths)} cropped images…")
 
         self.worker = ProcessingWorker(self)
         self.worker.setup_extract_images(
-            extract_client, files, extract_model, extraction_prompt,
+            extract_client, cropped_paths, extract_model, extraction_prompt,
             summary_model, summary_prompt, include_summary, image_type="path"
         )
         self.worker.progress.connect(self._on_worker_progress)
