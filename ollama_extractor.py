@@ -789,9 +789,35 @@ class CropPreviewDialog(QDialog):
         top_row.addWidget(self.top_value)
         controls_layout.addLayout(top_row)
 
-        # Right slider (inverted - higher value = more cropped)
+        # Bottom slider
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(QLabel("Bottom:"))
+        self.bottom_slider = QSlider(Qt.Horizontal)
+        self.bottom_slider.setRange(self.height // 2, self.height)
+        self.bottom_slider.setValue(self.crop_box[3])
+        self.bottom_slider.valueChanged.connect(self._on_bottom_changed)
+        bottom_row.addWidget(self.bottom_slider)
+        self.bottom_value = QLabel(str(self.crop_box[3]))
+        self.bottom_value.setMinimumWidth(50)
+        bottom_row.addWidget(self.bottom_value)
+        controls_layout.addLayout(bottom_row)
+
+        # Left slider
+        left_row = QHBoxLayout()
+        left_row.addWidget(QLabel("Left:"))
+        self.left_slider = QSlider(Qt.Horizontal)
+        self.left_slider.setRange(0, self.width // 2)
+        self.left_slider.setValue(self.crop_box[0])
+        self.left_slider.valueChanged.connect(self._on_left_changed)
+        left_row.addWidget(self.left_slider)
+        self.left_value = QLabel(str(self.crop_box[0]))
+        self.left_value.setMinimumWidth(50)
+        left_row.addWidget(self.left_value)
+        controls_layout.addLayout(left_row)
+
+        # Right slider
         right_row = QHBoxLayout()
-        right_row.addWidget(QLabel("Right edge:"))
+        right_row.addWidget(QLabel("Right:"))
         self.right_slider = QSlider(Qt.Horizontal)
         self.right_slider.setRange(self.width // 2, self.width)
         self.right_slider.setValue(self.crop_box[2])
@@ -845,6 +871,18 @@ class CropPreviewDialog(QDialog):
         self._update_preview()
         self._update_info()
 
+    def _on_bottom_changed(self, value):
+        self.crop_box[3] = value
+        self.bottom_value.setText(str(value))
+        self._update_preview()
+        self._update_info()
+
+    def _on_left_changed(self, value):
+        self.crop_box[0] = value
+        self.left_value.setText(str(value))
+        self._update_preview()
+        self._update_info()
+
     def _on_right_changed(self, value):
         self.crop_box[2] = value
         self.right_value.setText(str(value))
@@ -889,9 +927,13 @@ class CropPreviewDialog(QDialog):
         # Draw semi-transparent overlay on cropped areas
         painter.setBrush(QColor(0, 0, 0, 100))
         painter.setPen(Qt.NoPen)
-        # Top area
+        # Top area (full width)
         painter.drawRect(0, 0, self.preview_width, scaled_top)
-        # Right area
+        # Bottom area (full width)
+        painter.drawRect(0, scaled_bottom, self.preview_width, self.preview_height - scaled_bottom)
+        # Left area (between top and bottom)
+        painter.drawRect(0, scaled_top, scaled_left, scaled_bottom - scaled_top)
+        # Right area (between top and bottom)
         painter.drawRect(scaled_right, scaled_top, self.preview_width - scaled_right, scaled_bottom - scaled_top)
 
         # Draw crop boundary
