@@ -1195,6 +1195,9 @@ class MainWindow(QMainWindow):
         self.model_summary.setEditable(True)
         self.btn_refresh_models = QPushButton("Refresh")
         self.btn_refresh_models.clicked.connect(self.refresh_models)
+        self.btn_test_connection = QPushButton("Test")
+        self.btn_test_connection.setToolTip("Test connection using test_image.png")
+        self.btn_test_connection.clicked.connect(self.test_ai_connection)
 
         # Prompts
         self.prompt_extract = QTextEdit()
@@ -1265,6 +1268,7 @@ class MainWindow(QMainWindow):
         models_row.addWidget(QLabel("Summary:"))
         models_row.addWidget(self.model_summary, 1)
         models_row.addWidget(self.btn_refresh_models)
+        models_row.addWidget(self.btn_test_connection)
         ai_layout.addLayout(models_row)
 
         # Prompts
@@ -1401,6 +1405,84 @@ class MainWindow(QMainWindow):
             self.btn_toggle_ai.setText("▶ AI Settings")
         else:
             self.btn_toggle_ai.setText("▼ AI Settings")
+
+    def test_ai_connection(self):
+        """Test the AI connection by extracting from test_image.png."""
+        # Check if AI client is initialized
+        if not self.ai_client:
+            QMessageBox.warning(self, "No AI Client", "AI client is not initialized.")
+            return
+
+        # Check extraction model is selected
+        extract_model = self.model_extract.currentText().strip()
+        if not extract_model:
+            QMessageBox.warning(self, "No Model", "Please select an extraction model first.")
+            return
+
+        # Find test image
+        test_image_path = Path(__file__).resolve().parent / "test_image.png"
+        if not test_image_path.exists():
+            QMessageBox.warning(self, "Test Image Missing",
+                f"test_image.png not found in:\n{test_image_path.parent}")
+            return
+
+        # Get extraction prompt
+        extraction_prompt = self.prompt_extract.toPlainText().strip() or DEFAULT_EXTRACTION_PROMPT
+
+        # Update UI
+        self.btn_test_connection.setEnabled(False)
+        self.btn_test_connection.setText("Testing...")
+        self.status_update(f"Testing connection with {extract_model}...")
+        QApplication.processEvents()
+
+        try:
+            # Attempt extraction
+            result = self.ai_client.extract_from_image_path(
+                extract_model, extraction_prompt, str(test_image_path)
+            )
+
+            # Show success dialog with result
+            self.btn_test_connection.setText("Test")
+            self.btn_test_connection.setEnabled(True)
+            self.status_update("Test successful!")
+
+            # Create a scrollable dialog to show the result
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Test Successful")
+            dialog.setMinimumSize(600, 400)
+            layout = QVBoxLayout(dialog)
+
+            # Success header
+            header = QLabel(f"<b>Endpoint:</b> {self.cfg.get('selected_endpoint', 'Unknown')}<br>"
+                          f"<b>Model:</b> {extract_model}<br>"
+                          f"<b>Status:</b> <span style='color:green'>SUCCESS</span>")
+            header.setTextFormat(Qt.RichText)
+            layout.addWidget(header)
+
+            # Result text
+            layout.addWidget(QLabel("<b>Extracted content:</b>"))
+            result_text = QTextEdit()
+            result_text.setPlainText(result.strip())
+            result_text.setReadOnly(True)
+            layout.addWidget(result_text)
+
+            # Close button
+            btn_close = QPushButton("Close")
+            btn_close.clicked.connect(dialog.accept)
+            layout.addWidget(btn_close)
+
+            dialog.exec()
+
+        except Exception as e:
+            self.btn_test_connection.setText("Test")
+            self.btn_test_connection.setEnabled(True)
+            self.status_update("Test failed!")
+
+            QMessageBox.critical(self, "Test Failed",
+                f"<b>Endpoint:</b> {self.cfg.get('selected_endpoint', 'Unknown')}<br>"
+                f"<b>Model:</b> {extract_model}<br>"
+                f"<b>Status:</b> <span style='color:red'>FAILED</span><br><br>"
+                f"<b>Error:</b><br>{str(e)}")
 
     def on_endpoint_changed(self, endpoint_name: str):
         """Handle endpoint selection change."""
