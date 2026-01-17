@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QFileDialog, QComboBox, QTextEdit, QSpinBox,
     QLineEdit, QMessageBox, QSystemTrayIcon, QMenu, QStyle, QCheckBox,
     QProgressBar, QDialog, QSlider, QGroupBox, QListWidget, QListWidgetItem,
-    QFormLayout, QScrollArea, QFrame
+    QFormLayout, QScrollArea, QFrame, QRadioButton
 )
 from PySide6.QtGui import QAction, QPixmap, QPainter, QPen, QColor
 
@@ -1202,11 +1202,29 @@ class MainWindow(QMainWindow):
         self.ai_settings_container.setVisible(False)
 
         # Model selection (models from all configured endpoints)
+        # Store models separately for filtering
+        self.local_models = []
+        self.cloud_models = []
+
+        # Radio buttons for extraction model source
+        self.radio_extract_local = QRadioButton("Local")
+        self.radio_extract_cloud = QRadioButton("Cloud")
+        self.radio_extract_local.setChecked(True)  # Default to local
+        self.radio_extract_local.toggled.connect(self._on_extract_source_changed)
+        self.radio_extract_cloud.toggled.connect(self._on_extract_source_changed)
+
+        # Radio buttons for summary model source
+        self.radio_summary_local = QRadioButton("Local")
+        self.radio_summary_cloud = QRadioButton("Cloud")
+        self.radio_summary_local.setChecked(True)  # Default to local
+        self.radio_summary_local.toggled.connect(self._on_summary_source_changed)
+        self.radio_summary_cloud.toggled.connect(self._on_summary_source_changed)
+
         self.model_extract = QComboBox()
-        self.model_extract.setToolTip("Vision model for extraction (format: Endpoint: model)")
+        self.model_extract.setToolTip("Vision model for extraction")
         self.model_extract.setEditable(True)
         self.model_summary = QComboBox()
-        self.model_summary.setToolTip("Model for summary generation (format: Endpoint: model)")
+        self.model_summary.setToolTip("Model for summary generation")
         self.model_summary.setEditable(True)
         self.btn_refresh_models = QPushButton("Refresh Models")
         self.btn_refresh_models.clicked.connect(self.refresh_models)
@@ -1276,14 +1294,18 @@ class MainWindow(QMainWindow):
 
         # Models row (extraction)
         extract_row = QHBoxLayout()
-        extract_row.addWidget(QLabel("Extraction model:"))
+        extract_row.addWidget(QLabel("Extraction:"))
+        extract_row.addWidget(self.radio_extract_local)
+        extract_row.addWidget(self.radio_extract_cloud)
         extract_row.addWidget(self.model_extract, 1)
         extract_row.addWidget(self.btn_test_connection)
         ai_layout.addLayout(extract_row)
 
         # Models row (summary)
         summary_row = QHBoxLayout()
-        summary_row.addWidget(QLabel("Summary model:"))
+        summary_row.addWidget(QLabel("Summary:"))
+        summary_row.addWidget(self.radio_summary_local)
+        summary_row.addWidget(self.radio_summary_cloud)
         summary_row.addWidget(self.model_summary, 1)
         summary_row.addWidget(self.btn_refresh_models)
         summary_row.addWidget(self.btn_manage_endpoints)
@@ -1784,7 +1806,8 @@ class MainWindow(QMainWindow):
     def refresh_models(self):
         """Fetch models from all configured endpoints and populate dropdowns."""
         endpoints = self.cfg.get("endpoints", [DEFAULT_OLLAMA_ENDPOINT])
-        all_models = []
+        self.local_models = []
+        self.cloud_models = []
         errors = []
 
         self.status_update("Refreshing models from all endpoints...")
@@ -1792,16 +1815,22 @@ class MainWindow(QMainWindow):
 
         for ep in endpoints:
             endpoint_name = ep.get("name", "Unknown")
+            endpoint_type = ep.get("type", "ollama")
             try:
                 client = AIClient(ep)
                 models = client.list_models()
-                # Prefix each model with endpoint name
+                # Prefix each model with endpoint name and store in appropriate list
                 for model in models:
-                    all_models.append(f"{endpoint_name}: {model}")
+                    model_str = f"{endpoint_name}: {model}"
+                    if endpoint_type == "ollama":
+                        self.local_models.append(model_str)
+                    else:
+                        self.cloud_models.append(model_str)
             except Exception as e:
                 errors.append(f"{endpoint_name}: {e}")
 
-        if not all_models and errors:
+        total_models = len(self.local_models) + len(self.cloud_models)
+        if total_models == 0 and errors:
             QMessageBox.warning(self, "No Models Found",
                 "Could not fetch models from any endpoint:\n\n" + "\n".join(errors))
             self.status_update("Failed to refresh models.")
@@ -1811,11 +1840,9 @@ class MainWindow(QMainWindow):
         old_extract = self.model_extract.currentText()
         old_summary = self.model_summary.currentText()
 
-        # Update dropdowns
-        self.model_extract.clear()
-        self.model_summary.clear()
-        self.model_extract.addItems(all_models)
-        self.model_summary.addItems(all_models)
+        # Update dropdowns based on radio button selection
+        self._update_extract_dropdown()
+        self._update_summary_dropdown()
 
         # Restore selections if possible
         if old_extract:
@@ -1829,9 +1856,45 @@ class MainWindow(QMainWindow):
 
         # Show status
         if errors:
-            self.status_update(f"Loaded {len(all_models)} models. Some endpoints failed.")
+            self.status_update(f"Loaded {total_models} models (local: {len(self.local_models)}, cloud: {len(self.cloud_models)}). Some endpoints failed.")
         else:
-            self.status_update(f"Loaded {len(all_models)} models from {len(endpoints)} endpoint(s).")
+            self.status_update(f"Loaded {total_models} models (local: {len(self.local_models)}, cloud: {len(self.cloud_models)}).")
+
+    def _update_extract_dropdown(self):
+        """Update extraction model dropdown based on radio button selection."""
+        old_text = self.model_extract.currentText()
+        self.model_extract.clear()
+        if self.radio_extract_local.isChecked():
+            self.model_extract.addItems(self.local_models)
+        else:
+            self.model_extract.addItems(self.cloud_models)
+        # Try to restore selection
+        if old_text:
+            i = self.model_extract.findText(old_text)
+            if i >= 0:
+                self.model_extract.setCurrentIndex(i)
+
+    def _update_summary_dropdown(self):
+        """Update summary model dropdown based on radio button selection."""
+        old_text = self.model_summary.currentText()
+        self.model_summary.clear()
+        if self.radio_summary_local.isChecked():
+            self.model_summary.addItems(self.local_models)
+        else:
+            self.model_summary.addItems(self.cloud_models)
+        # Try to restore selection
+        if old_text:
+            i = self.model_summary.findText(old_text)
+            if i >= 0:
+                self.model_summary.setCurrentIndex(i)
+
+    def _on_extract_source_changed(self):
+        """Handle extraction source radio button change."""
+        self._update_extract_dropdown()
+
+    def _on_summary_source_changed(self):
+        """Handle summary source radio button change."""
+        self._update_summary_dropdown()
 
     # --------------------------- Mode A ---------------------------
 
