@@ -1614,13 +1614,19 @@ class MainWindow(QMainWindow):
             return None
 
         crop_mode = dialog.get_crop_mode()  # "none", "all", or "each"
-        crop_percentages = None
+        crop_percentages = None  # (left_pct, top_pct, right_pct, bottom_pct)
 
         if crop_mode == "all":
             crop_box = dialog.get_crop_region()
-            crop_percentages = (crop_box[1] / height, crop_box[2] / width)
+            # Store all 4 percentages for applying to different sized images
+            crop_percentages = (
+                crop_box[0] / width,   # left
+                crop_box[1] / height,  # top
+                crop_box[2] / width,   # right
+                crop_box[3] / height   # bottom
+            )
         elif crop_mode == "none":
-            crop_percentages = (0.0, 1.0)
+            crop_percentages = (0.0, 0.0, 1.0, 1.0)  # No crop: full image
 
         # Process all images
         cropped_images = []
@@ -1642,9 +1648,14 @@ class MainWindow(QMainWindow):
                         if each_mode != "none":
                             crop_box = each_dialog.get_crop_region()
                             img = img.crop(crop_box)
-                elif crop_percentages and crop_percentages != (0.0, 1.0):
-                    top_pct, right_pct = crop_percentages
-                    crop_box = (0, int(h * top_pct), int(w * right_pct), h)
+                elif crop_percentages and crop_percentages != (0.0, 0.0, 1.0, 1.0):
+                    left_pct, top_pct, right_pct, bottom_pct = crop_percentages
+                    crop_box = (
+                        int(w * left_pct),
+                        int(h * top_pct),
+                        int(w * right_pct),
+                        int(h * bottom_pct)
+                    )
                     img = img.crop(crop_box)
 
                 cropped_images.append(img)
