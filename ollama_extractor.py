@@ -1819,14 +1819,25 @@ class MainWindow(QMainWindow):
             try:
                 client = AIClient(ep)
                 models = client.list_models()
-                # Prefix each model with endpoint name and store in appropriate list
-                for model in models:
-                    model_str = f"{endpoint_name}: {model}"
-                    if endpoint_type == "ollama":
-                        self.local_models.append(model_str)
+
+                if endpoint_type == "ollama":
+                    # For Ollama, use the actual model list
+                    for model in models:
+                        self.local_models.append(f"{endpoint_name}: {model}")
+                else:
+                    # For cloud endpoints, Azure doesn't return model list
+                    # Use endpoint name as the model (it's usually the deployment name)
+                    if models:
+                        for model in models:
+                            self.cloud_models.append(f"{endpoint_name}: {model}")
                     else:
-                        self.cloud_models.append(model_str)
+                        # No models returned - use endpoint name as model
+                        self.cloud_models.append(f"{endpoint_name}: {endpoint_name}")
             except Exception as e:
+                # For cloud endpoints, still add them even if connection fails
+                # (user may have configured correctly but endpoint is temporarily unavailable)
+                if endpoint_type != "ollama":
+                    self.cloud_models.append(f"{endpoint_name}: {endpoint_name}")
                 errors.append(f"{endpoint_name}: {e}")
 
         total_models = len(self.local_models) + len(self.cloud_models)
