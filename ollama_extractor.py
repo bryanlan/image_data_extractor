@@ -1160,7 +1160,24 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
         self.btn_cancel.clicked.connect(self.cancel_processing)
 
-        # === COLLAPSIBLE AI SECTION ===
+        # === AI ACTION BUTTONS (in main section) ===
+        self.btn_mode_a = QPushButton("Process Saved Images")
+        self.btn_mode_a.setToolTip("Select images and extract content using AI")
+        self.btn_mode_a.clicked.connect(self.process_images_mode)
+
+        self.btn_complete = QPushButton("Complete & Save HTML")
+        self.btn_complete.setVisible(False)
+        self.btn_complete.clicked.connect(self.complete_and_save)
+
+        # === COLLAPSIBLE AI SETTINGS (toggle button + hidden container) ===
+        self.btn_toggle_ai = QPushButton("▶ AI Settings")
+        self.btn_toggle_ai.setStyleSheet("text-align: left; padding: 5px 10px; font-weight: bold;")
+        self.btn_toggle_ai.setFlat(True)
+        self.btn_toggle_ai.clicked.connect(self._toggle_ai_settings)
+
+        # Container for AI settings (hidden by default)
+        self.ai_settings_container = QWidget()
+        self.ai_settings_container.setVisible(False)
 
         # Endpoint selection
         self.endpoint_combo = QComboBox()
@@ -1182,10 +1199,10 @@ class MainWindow(QMainWindow):
         # Prompts
         self.prompt_extract = QTextEdit()
         self.prompt_extract.setPlainText(self.cfg.get("extraction_prompt", DEFAULT_EXTRACTION_PROMPT))
-        self.prompt_extract.setMaximumHeight(100)
+        self.prompt_extract.setMaximumHeight(80)
         self.prompt_summary = QTextEdit()
         self.prompt_summary.setPlainText(self.cfg.get("summary_prompt", DEFAULT_SUMMARY_PROMPT))
-        self.prompt_summary.setMaximumHeight(100)
+        self.prompt_summary.setMaximumHeight(80)
 
         # AI options
         self.include_summary_checkbox = QCheckBox("Include Summary")
@@ -1195,15 +1212,6 @@ class MainWindow(QMainWindow):
         self.defer_checkbox = QCheckBox("Defer processing")
         self.defer_checkbox.setChecked(bool(self.cfg.get("defer_processing", True)))
         self.defer_checkbox.stateChanged.connect(self.on_defer_changed)
-
-        # AI action buttons
-        self.btn_mode_a = QPushButton("Process Saved Images")
-        self.btn_mode_a.setToolTip("Extract content from images using AI")
-        self.btn_mode_a.clicked.connect(self.process_images_mode)
-
-        self.btn_complete = QPushButton("Complete & Save HTML")
-        self.btn_complete.setVisible(False)
-        self.btn_complete.clicked.connect(self.complete_and_save)
 
         # === LAYOUT ===
         root = QWidget()
@@ -1229,16 +1237,19 @@ class MainWindow(QMainWindow):
         # Main actions row
         main_actions = QHBoxLayout()
         main_actions.addWidget(self.btn_create_ppt)
+        main_actions.addWidget(self.btn_mode_a)
+        main_actions.addWidget(self.btn_complete)
         main_actions.addStretch()
         main_actions.addWidget(self.queue_label)
         main_actions.addWidget(self.btn_complete_ppt)
         v.addLayout(main_actions)
 
-        # Collapsible AI section
-        self.ai_group = QGroupBox("AI Extraction Settings")
-        self.ai_group.setCheckable(True)
-        self.ai_group.setChecked(False)  # Collapsed by default
-        ai_layout = QVBoxLayout(self.ai_group)
+        # Collapsible AI settings toggle
+        v.addWidget(self.btn_toggle_ai)
+
+        # AI settings container (hidden by default)
+        ai_layout = QVBoxLayout(self.ai_settings_container)
+        ai_layout.setContentsMargins(20, 5, 5, 10)  # Indent the settings
 
         # Endpoint row
         endpoint_row = QHBoxLayout()
@@ -1269,14 +1280,7 @@ class MainWindow(QMainWindow):
         ai_options.addStretch()
         ai_layout.addLayout(ai_options)
 
-        # AI actions row
-        ai_actions = QHBoxLayout()
-        ai_actions.addWidget(self.btn_mode_a)
-        ai_actions.addWidget(self.btn_complete)
-        ai_actions.addStretch()
-        ai_layout.addLayout(ai_actions)
-
-        v.addWidget(self.ai_group)
+        v.addWidget(self.ai_settings_container)
 
         # Progress section
         v.addWidget(self.activity_label)
@@ -1388,6 +1392,15 @@ class MainWindow(QMainWindow):
                 self.endpoint_combo.setCurrentIndex(idx)
         finally:
             self.endpoint_combo.blockSignals(False)
+
+    def _toggle_ai_settings(self):
+        """Toggle visibility of AI settings panel."""
+        is_visible = self.ai_settings_container.isVisible()
+        self.ai_settings_container.setVisible(not is_visible)
+        if is_visible:
+            self.btn_toggle_ai.setText("▶ AI Settings")
+        else:
+            self.btn_toggle_ai.setText("▼ AI Settings")
 
     def on_endpoint_changed(self, endpoint_name: str):
         """Handle endpoint selection change."""
