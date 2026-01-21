@@ -132,6 +132,8 @@ def load_config():
         "summary_prompt": DEFAULT_SUMMARY_PROMPT,
         "extraction_model": "",
         "summary_model": "",
+        "extraction_source": "local",  # "local" or "cloud"
+        "summary_source": "local",  # "local" or "cloud"
         "hotkey": DEFAULT_HOTKEY,
         "hotkey_enabled": True,
         "defer_processing": True,
@@ -1417,6 +1419,19 @@ class MainWindow(QMainWindow):
         # Populate models
         self.refresh_models()
 
+        # Restore radio button states
+        extraction_source = self.cfg.get("extraction_source", "local")
+        if extraction_source == "cloud":
+            self.radio_extract_cloud.setChecked(True)
+        else:
+            self.radio_extract_local.setChecked(True)
+
+        summary_source = self.cfg.get("summary_source", "local")
+        if summary_source == "cloud":
+            self.radio_summary_cloud.setChecked(True)
+        else:
+            self.radio_summary_local.setChecked(True)
+
         # Apply last used models if they exist
         ex = self.cfg.get("extraction_model", "")
         sm = self.cfg.get("summary_model", "")
@@ -1833,6 +1848,8 @@ class MainWindow(QMainWindow):
         self.cfg["defer_processing"] = self.defer_checkbox.isChecked()
         self.cfg["extraction_model"] = self.model_extract.currentText().strip()
         self.cfg["summary_model"] = self.model_summary.currentText().strip()
+        self.cfg["extraction_source"] = "cloud" if self.radio_extract_cloud.isChecked() else "local"
+        self.cfg["summary_source"] = "cloud" if self.radio_summary_cloud.isChecked() else "local"
         self.cfg["include_summary"] = self.include_summary_checkbox.isChecked()
         save_config(self.cfg)
 
