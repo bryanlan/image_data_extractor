@@ -31,7 +31,7 @@ from pathlib import Path
 from datetime import datetime
 
 # UI
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QComboBox, QTextEdit, QSpinBox,
@@ -44,6 +44,7 @@ from PySide6.QtGui import QAction, QPixmap, QPainter, QPen, QColor
 # Imaging
 from PIL import ImageGrab, Image
 import numpy as np
+import imagehash
 
 # Global hotkey
 import keyboard  # global hook (Windows); may require admin depending on system
@@ -139,6 +140,10 @@ def load_config():
         "defer_processing": True,
         "interim_save_folder": str(Path.home()),  # Default to user's home directory
         "include_summary": True,
+        # Auto-capture on slide change settings
+        "auto_capture_enabled": False,
+        "auto_capture_interval_sec": 5.0,
+        "auto_capture_threshold": 15,
         # Endpoint configuration
         "endpoints": [
             {"name": "Ollama (local)", "type": "ollama", "url": "http://localhost:11434", "api_key": ""}
@@ -745,6 +750,241 @@ Example outputs: quarterly-sales-report, meeting-notes-jan, product-screenshots,
         self.finished_ok.emit({"suggested_name": suggested_name, "folder_path": folder_path})
 
 
+class SlideReviewDialog(QDialog):
+    """Dialog showing thumbnails of all slides for review and deletion of duplicates."""
+
+    def __init__(self, image_paths: list[Path], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Review Slides ({len(image_paths)} images)")
+        self.setModal(True)
+        self.resize(900, 600)
+
+        self.image_paths = list(image_paths)  # Make a copy
+        self.selected_indices: set[int] = set()
+        self.thumbnail_widgets: list[QFrame] = []
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Instructions
+        instructions = QLabel(
+            "Click to select slides (Ctrl+click for multiple). Delete duplicates before cropping."
+        )
+        instructions.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(instructions)
+
+        # Scroll area for thumbnails
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Container for thumbnail grid
+        container = QWidget()
+        self.grid_layout = QVBoxLayout(container)
+        self.grid_layout.setSpacing(10)
+
+        self._populate_thumbnails()
+
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        # Selection info
+        self.selection_label = QLabel("0 selected")
+        layout.addWidget(self.selection_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        self.btn_delete = QPushButton("Delete Selected")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.clicked.connect(self._delete_selected)
+        self.btn_delete.setStyleSheet("background-color: #c62828; color: white;")
+
+        btn_select_all = QPushButton("Select All")
+        btn_select_all.clicked.connect(self._select_all)
+
+        btn_clear = QPushButton("Clear Selection")
+        btn_clear.clicked.connect(self._clear_selection)
+
+        self.btn_continue = QPushButton(f"Continue with {len(self.image_paths)} images")
+        self.btn_continue.clicked.connect(self.accept)
+        self.btn_continue.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold;")
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_layout.addWidget(self.btn_delete)
+        btn_layout.addWidget(btn_select_all)
+        btn_layout.addWidget(btn_clear)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(self.btn_continue)
+        layout.addLayout(btn_layout)
+
+    def _populate_thumbnails(self):
+        """Create thumbnail grid."""
+        # Clear existing
+        for widget in self.thumbnail_widgets:
+            widget.deleteLater()
+        self.thumbnail_widgets.clear()
+
+        # Create rows of thumbnails (4 per row)
+        COLS = 4
+        THUMB_SIZE = 180
+
+        row_layout = None
+        for i, img_path in enumerate(self.image_paths):
+            if i % COLS == 0:
+                row_layout = QHBoxLayout()
+                row_layout.setSpacing(10)
+                self.grid_layout.addLayout(row_layout)
+
+            # Create thumbnail frame
+            frame = QFrame()
+            frame.setFrameStyle(QFrame.Box)
+            frame.setLineWidth(2)
+            frame.setFixedSize(THUMB_SIZE + 10, THUMB_SIZE + 30)
+            frame.setCursor(Qt.PointingHandCursor)
+            frame.setProperty("index", i)
+            frame.mousePressEvent = lambda event, idx=i: self._on_thumbnail_clicked(event, idx)
+
+            frame_layout = QVBoxLayout(frame)
+            frame_layout.setContentsMargins(5, 5, 5, 5)
+            frame_layout.setSpacing(2)
+
+            # Thumbnail image
+            thumb_label = QLabel()
+            thumb_label.setFixedSize(THUMB_SIZE, THUMB_SIZE - 20)
+            thumb_label.setAlignment(Qt.AlignCenter)
+            thumb_label.setScaledContents(False)
+
+            try:
+                img = Image.open(img_path)
+                img.thumbnail((THUMB_SIZE - 10, THUMB_SIZE - 30), Image.LANCZOS)
+
+                # Convert to QPixmap
+                from io import BytesIO
+                buf = BytesIO()
+                img.save(buf, format='PNG')
+                buf.seek(0)
+                pixmap = QPixmap()
+                pixmap.loadFromData(buf.getvalue())
+                thumb_label.setPixmap(pixmap)
+            except Exception:
+                thumb_label.setText("Error loading")
+
+            frame_layout.addWidget(thumb_label)
+
+            # Filename label
+            name_label = QLabel(f"{i+1}. {img_path.name[:20]}...")
+            name_label.setAlignment(Qt.AlignCenter)
+            name_label.setStyleSheet("font-size: 10px;")
+            frame_layout.addWidget(name_label)
+
+            self.thumbnail_widgets.append(frame)
+            row_layout.addWidget(frame)
+
+        # Fill remaining space in last row
+        if row_layout:
+            remaining = COLS - (len(self.image_paths) % COLS)
+            if remaining < COLS:
+                for _ in range(remaining):
+                    spacer = QWidget()
+                    spacer.setFixedSize(THUMB_SIZE + 10, THUMB_SIZE + 30)
+                    row_layout.addWidget(spacer)
+
+        self.grid_layout.addStretch()
+        self._update_selection_display()
+
+    def _on_thumbnail_clicked(self, event, index: int):
+        """Handle thumbnail click."""
+        from PySide6.QtCore import Qt as QtCore
+        if event.modifiers() & QtCore.ControlModifier:
+            # Ctrl+click: toggle selection
+            if index in self.selected_indices:
+                self.selected_indices.discard(index)
+            else:
+                self.selected_indices.add(index)
+        else:
+            # Regular click: select only this one (or toggle if already only selection)
+            if self.selected_indices == {index}:
+                self.selected_indices.clear()
+            else:
+                self.selected_indices = {index}
+
+        self._update_selection_display()
+
+    def _update_selection_display(self):
+        """Update visual selection state and labels."""
+        for i, frame in enumerate(self.thumbnail_widgets):
+            if i in self.selected_indices:
+                frame.setStyleSheet("QFrame { border: 3px solid #c62828; background-color: #ffebee; }")
+            else:
+                frame.setStyleSheet("QFrame { border: 1px solid #ccc; background-color: white; }")
+
+        count = len(self.selected_indices)
+        self.selection_label.setText(f"{count} selected")
+        self.btn_delete.setEnabled(count > 0)
+        self.btn_delete.setText(f"Delete Selected ({count})" if count > 0 else "Delete Selected")
+
+    def _select_all(self):
+        """Select all thumbnails."""
+        self.selected_indices = set(range(len(self.image_paths)))
+        self._update_selection_display()
+
+    def _clear_selection(self):
+        """Clear selection."""
+        self.selected_indices.clear()
+        self._update_selection_display()
+
+    def _delete_selected(self):
+        """Delete selected images from the list."""
+        if not self.selected_indices:
+            return
+
+        # Confirm deletion
+        count = len(self.selected_indices)
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Remove {count} image(s) from the list?\n\n(Files will NOT be deleted from disk)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Remove from list (in reverse order to maintain indices)
+        for idx in sorted(self.selected_indices, reverse=True):
+            del self.image_paths[idx]
+
+        self.selected_indices.clear()
+
+        # Rebuild thumbnails
+        # Clear old layouts
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            if item.layout():
+                while item.layout().count():
+                    child = item.layout().takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+
+        self._populate_thumbnails()
+
+        # Update window title and continue button
+        self.setWindowTitle(f"Review Slides ({len(self.image_paths)} images)")
+        self.btn_continue.setText(f"Continue with {len(self.image_paths)} images")
+
+        if len(self.image_paths) == 0:
+            QMessageBox.warning(self, "No Images", "All images have been removed.")
+            self.reject()
+
+    def get_remaining_paths(self) -> list[Path]:
+        """Return the list of image paths after any deletions."""
+        return self.image_paths
+
+
 class CropPreviewDialog(QDialog):
     """Dialog showing crop preview with adjustment controls and 3-button choice."""
 
@@ -971,6 +1211,149 @@ class CropPreviewDialog(QDialog):
         return self._crop_mode
 
 
+class StepCard(QFrame):
+    """Large card widget for workflow steps with icon, title, description, status, and action button."""
+    clicked = Signal()
+
+    def __init__(self, step_num: int, icon: str, title: str, description: str, parent=None):
+        super().__init__(parent)
+        self.step_num = step_num
+        self._status_text = ""
+        self._status_detail = ""
+        self._is_complete = False
+
+        self.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        self.setStyleSheet("""
+            StepCard {
+                background-color: #fafafa;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 12px;
+            }
+            StepCard:disabled {
+                background-color: #f0f0f0;
+                border-color: #e0e0e0;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # Header row: step number + icon + title
+        header = QHBoxLayout()
+        step_label = QLabel(f"STEP {step_num}:")
+        step_label.setStyleSheet("font-size: 10px; color: #888; font-weight: bold;")
+        header.addWidget(step_label)
+
+        title_label = QLabel(f"{icon} {title}")
+        title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        header.addWidget(title_label)
+        header.addStretch()
+        layout.addLayout(header)
+
+        # Description
+        desc_label = QLabel(description)
+        desc_label.setStyleSheet("color: #666; font-size: 11px;")
+        desc_label.setWordWrap(True)
+        layout.addWidget(desc_label)
+
+        # Status row: status label + action button
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("Status: Not started")
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        status_row.addWidget(self.status_label, 1)
+
+        self.action_btn = QPushButton("Start")
+        self.action_btn.setMinimumWidth(100)
+        self.action_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1565c0;
+            }
+            QPushButton:disabled {
+                background-color: #bdbdbd;
+            }
+        """)
+        self.action_btn.clicked.connect(self.clicked.emit)
+        status_row.addWidget(self.action_btn)
+        layout.addLayout(status_row)
+
+    def set_status(self, status: str, detail: str = ""):
+        """Update the status text shown on the card."""
+        self._status_text = status
+        self._status_detail = detail
+        self._is_complete = status.startswith("✓")
+        if detail:
+            self.status_label.setText(f"Status: {status}")
+            self.status_label.setToolTip(detail)
+        else:
+            self.status_label.setText(f"Status: {status}")
+            self.status_label.setToolTip("")
+
+        # Update styling based on completion
+        if self._is_complete:
+            self.status_label.setStyleSheet("color: #2e7d32; font-size: 11px; font-weight: bold;")
+        else:
+            self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+
+    def set_button_text(self, text: str):
+        """Update the action button text."""
+        self.action_btn.setText(text)
+
+    def set_button_style(self, style: str):
+        """Set button style: 'primary' (blue), 'success' (green), or 'secondary' (gray)."""
+        if style == "success":
+            self.action_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2e7d32;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #1b5e20; }
+                QPushButton:disabled { background-color: #bdbdbd; }
+            """)
+        elif style == "secondary":
+            self.action_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #757575;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #616161; }
+                QPushButton:disabled { background-color: #bdbdbd; }
+            """)
+        else:  # primary
+            self.action_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #1976d2;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #1565c0; }
+                QPushButton:disabled { background-color: #bdbdbd; }
+            """)
+
+    def is_complete(self) -> bool:
+        """Return whether this step is marked as complete."""
+        return self._is_complete
+
+
 class EndpointManagerDialog(QDialog):
     """Dialog for managing AI endpoints (Ollama, Azure, OpenAI-compatible)."""
 
@@ -1114,39 +1497,193 @@ class EndpointManagerDialog(QDialog):
         return self.endpoints
 
 
-class HotkeyListener(QThread):
-    pressed = Signal()  # emitted on hotkey press
+class HotkeyManager(QObject):
+    """Manages global hotkeys without creating extra windows or threads."""
+    manual_capture_pressed = Signal()
+    auto_capture_pressed = Signal()
 
-    def __init__(self, hotkey: str, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.hotkey = hotkey
-        self._hook_id = None
+        self._manual_hook = None
+        self._auto_hook = None
+
+    def set_manual_hotkey(self, hotkey: str):
+        """Set or update the manual capture hotkey."""
+        try:
+            if self._manual_hook is not None:
+                keyboard.remove_hotkey(self._manual_hook)
+                self._manual_hook = None
+        except Exception:
+            pass
+        try:
+            if hotkey:
+                self._manual_hook = keyboard.add_hotkey(hotkey, self._on_manual_pressed, suppress=False)
+                print(f"[DEBUG] Manual hotkey '{hotkey}' registered successfully")
+        except Exception as e:
+            print(f"Failed to bind manual hotkey '{hotkey}': {e}")
+
+    def set_auto_hotkey(self, hotkey: str):
+        """Set or update the auto-capture toggle hotkey."""
+        try:
+            if self._auto_hook is not None:
+                keyboard.remove_hotkey(self._auto_hook)
+                self._auto_hook = None
+        except Exception:
+            pass
+        try:
+            if hotkey:
+                self._auto_hook = keyboard.add_hotkey(hotkey, self._on_auto_pressed, suppress=False)
+                print(f"[DEBUG] Auto hotkey '{hotkey}' registered successfully")
+        except Exception as e:
+            print(f"Failed to bind auto hotkey '{hotkey}': {e}")
+
+    def _on_manual_pressed(self):
+        """Called when manual capture hotkey is pressed (from keyboard thread)."""
+        print("[DEBUG] Manual capture hotkey pressed!")
+        # Qt signals with AutoConnection handle cross-thread emission automatically
+        self.manual_capture_pressed.emit()
+        print("[DEBUG] Manual signal emitted")
+
+    def _on_auto_pressed(self):
+        """Called when auto-capture toggle hotkey is pressed (from keyboard thread)."""
+        print("[DEBUG] Auto-capture toggle hotkey pressed!")
+        # Qt signals with AutoConnection handle cross-thread emission automatically
+        self.auto_capture_pressed.emit()
+        print("[DEBUG] Auto signal emitted")
+
+    def cleanup(self):
+        """Remove all hotkeys."""
+        try:
+            if self._manual_hook is not None:
+                keyboard.remove_hotkey(self._manual_hook)
+        except Exception:
+            pass
+        try:
+            if self._auto_hook is not None:
+                keyboard.remove_hotkey(self._auto_hook)
+        except Exception:
+            pass
+        self._manual_hook = None
+        self._auto_hook = None
+
+
+class SlideChangeDetector:
+    """Detects slide changes using perceptual hashing."""
+
+    def __init__(self, threshold: int = 5):
+        self.threshold = threshold  # Hamming distance threshold
+        self.last_hash = None
+
+    def compute_hash(self, pil_image: Image.Image):
+        """Compute dhash from PIL image."""
+        return imagehash.dhash(pil_image, hash_size=8)
+
+    def has_changed(self, pil_image: Image.Image) -> tuple[bool, int]:
+        """Returns (changed, distance) - True if image is different enough from last check."""
+        current_hash = self.compute_hash(pil_image)
+        if self.last_hash is None:
+            self.last_hash = current_hash
+            print(f"[AUTO-CAPTURE] First frame captured (no previous hash)")
+            return True, 0  # First image always captures
+
+        distance = self.last_hash - current_hash  # Hamming distance
+        changed = distance >= self.threshold
+
+        # Always update last_hash to compare consecutive frames
+        # This prevents drift accumulation when screen gradually changes
+        self.last_hash = current_hash
+
+        if changed:
+            print(f"[AUTO-CAPTURE] CAPTURED: distance={distance} >= threshold={self.threshold}")
+        else:
+            print(f"[AUTO-CAPTURE] Skipped: distance={distance} < threshold={self.threshold}")
+        return changed, distance
+
+    def reset(self):
+        """Reset detector state (new session)."""
+        self.last_hash = None
+
+
+class AutoCaptureWorker(QThread):
+    """Background thread that periodically checks for slide changes."""
+
+    frame_captured = Signal(object, str)  # (pil_image, source="auto")
+    status_update = Signal(str)  # For debug/status messages
+    error = Signal(str)
+
+    def __init__(self, detector: SlideChangeDetector, interval_sec: float = 1.0, parent=None):
+        super().__init__(parent)
+        self.detector = detector
+        self.interval_sec = interval_sec
+        self._running = False
+        self.startup_delay_sec = 2.0  # Give user time to switch windows
 
     def run(self):
-        try:
-            self._hook_id = keyboard.add_hotkey(self.hotkey, lambda: self.pressed.emit())
-            keyboard.wait()  # blocks in this thread
-        except Exception:
-            pass
+        self._running = True
 
-    def rebind(self, hotkey: str):
-        try:
-            if self._hook_id is not None:
-                keyboard.remove_hotkey(self._hook_id)
-        except Exception:
-            pass
-        self.hotkey = hotkey
-        try:
-            self._hook_id = keyboard.add_hotkey(self.hotkey, lambda: self.pressed.emit())
-        except Exception:
-            pass
+        # Wait before starting to give user time to switch to target window
+        self.status_update.emit(f"Starting in {self.startup_delay_sec:.0f}s - switch to target window now!")
+        self.msleep(int(self.startup_delay_sec * 1000))
+
+        if not self._running:
+            return
+
+        self.status_update.emit("Now monitoring active window for changes...")
+
+        while self._running:
+            try:
+                bbox, hwnd = get_active_window_bbox()
+                img = ImageGrab.grab(bbox=bbox)
+
+                changed, distance = self.detector.has_changed(img)
+                if changed:
+                    self.frame_captured.emit(img, "auto")
+            except Exception as e:
+                self.error.emit(str(e))
+
+            self.msleep(int(self.interval_sec * 1000))
 
     def stop(self):
-        try:
-            if self._hook_id is not None:
-                keyboard.remove_hotkey(self._hook_id)
-        except Exception:
-            pass
+        self._running = False
+        if not self.wait(1000):  # Wait up to 1 second
+            self.terminate()  # Force terminate if still running
+            self.wait(500)
+
+
+class RecordingOverlay(QWidget):
+    """Floating overlay window that shows recording status."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+
+        # Use solid red background for the entire widget (works better on Windows)
+        self.setStyleSheet("background-color: #c62828; border-radius: 6px;")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+
+        self.label = QLabel("\U0001F534 RECORDING - Press hotkey to stop")
+        self.label.setStyleSheet("""
+            QLabel {
+                background-color: transparent;
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+            }
+        """)
+        layout.addWidget(self.label)
+
+        self.adjustSize()
+
+    def showAtTop(self):
+        """Position at top center of primary screen and show."""
+        screen = QApplication.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = 10  # 10 pixels from top
+        self.move(x, y)
+        self.show()
+        self.raise_()
 
 
 class MainWindow(QMainWindow):
@@ -1170,21 +1707,45 @@ class MainWindow(QMainWindow):
         self._pending_html: str | None = None  # Store HTML during rename operation
         self._pending_timestamp: str | None = None  # Store timestamp for immediate processing
 
+        # ---------- Auto-capture state ----------
+        self.slide_detector: SlideChangeDetector | None = None
+        self.auto_capture_worker: AutoCaptureWorker | None = None
+        self.auto_capture_count = 0
+        self.recording_overlay: RecordingOverlay | None = None
+
+        # Single hotkey manager for all hotkeys (no threads, no extra windows)
+        self.hotkey_manager = HotkeyManager(self)
+        # Use QueuedConnection to ensure slots run in main thread (hotkey callbacks come from keyboard thread)
+        self.hotkey_manager.manual_capture_pressed.connect(self.manual_capture, Qt.QueuedConnection)
+        self.hotkey_manager.auto_capture_pressed.connect(self.toggle_auto_capture, Qt.QueuedConnection)
+        print("[DEBUG] Hotkey signals connected")
+
+        # ---------- Session state (for new UI workflow) ----------
+        self.session_state = {
+            "ppt_created": False,
+            "ppt_path": None,
+            "cropped_images": [],     # paths to cropped images after PPT step
+            "ai_extracted": False,
+            "html_path": None,
+        }
+
         # ---------- UI ----------
 
         # === MAIN CONTROLS (always visible) ===
 
-        # Hotkey controls
-        self.hotkey_enabled_checkbox = QCheckBox("Hotkey enabled")
-        self.hotkey_enabled_checkbox.setChecked(bool(self.cfg.get("hotkey_enabled", True)))
-        self.hotkey_enabled_checkbox.setToolTip("Enable or disable the global hotkey for capturing")
-        self.hotkey_enabled_checkbox.stateChanged.connect(self.on_hotkey_enabled_changed)
+        # Manual capture hotkey
+        self.manual_hotkey_edit = QLineEdit(self.cfg.get("manual_capture_hotkey", "ctrl+alt+p"))
+        self.manual_hotkey_edit.setMaximumWidth(120)
+        self.manual_hotkey_edit.setToolTip("Press this hotkey to capture a single frame")
+        self.btn_rebind_manual_hotkey = QPushButton("Bind")
+        self.btn_rebind_manual_hotkey.clicked.connect(self.rebind_manual_capture_hotkey)
 
-        self.hotkey_edit = QLineEdit(self.cfg.get("hotkey", DEFAULT_HOTKEY))
-        self.hotkey_edit.setMaximumWidth(120)
-        self.hotkey_edit.setToolTip("Global hotkey combination (e.g. ctrl+alt+p)")
-        self.btn_rebind_hotkey = QPushButton("Bind")
-        self.btn_rebind_hotkey.clicked.connect(self.rebind_hotkey)
+        # Auto-capture hotkey (separate from manual capture hotkey)
+        self.auto_hotkey_edit = QLineEdit(self.cfg.get("auto_capture_hotkey", "ctrl+alt+r"))
+        self.auto_hotkey_edit.setMaximumWidth(120)
+        self.auto_hotkey_edit.setToolTip("Press this hotkey to toggle auto-capture ON/OFF")
+        self.btn_rebind_auto_hotkey = QPushButton("Bind")
+        self.btn_rebind_auto_hotkey.clicked.connect(self.rebind_auto_capture_hotkey)
 
         # Folder controls
         self.folder_label = QLabel(self._short_folder_path())
@@ -1194,21 +1755,104 @@ class MainWindow(QMainWindow):
         self.btn_open_folder = QPushButton("Open")
         self.btn_open_folder.clicked.connect(self.open_session_folder)
 
-        # Main action buttons
-        self.btn_create_ppt = QPushButton("Create PPT from Folder")
-        self.btn_create_ppt.setToolTip("Select a folder of images, crop them, create PowerPoint")
-        self.btn_create_ppt.clicked.connect(self.create_ppt_from_folder)
+        # Auto-capture controls
+        self.auto_capture_checkbox = QCheckBox("Auto-capture on slide change")
+        # Always start with auto-capture DISABLED - user must explicitly enable it each session
+        self.auto_capture_checkbox.setChecked(False)
+        self.auto_capture_checkbox.setToolTip("Automatically capture when screen content changes significantly")
+        self.auto_capture_checkbox.stateChanged.connect(self.on_auto_capture_changed)
 
-        self.btn_complete_ppt = QPushButton("Complete PPT")
+        self.interval_spinbox = QSpinBox()
+        self.interval_spinbox.setRange(500, 10000)  # milliseconds
+        self.interval_spinbox.setSingleStep(500)
+        self.interval_spinbox.setValue(int(self.cfg.get("auto_capture_interval_sec", 5.0) * 1000))
+        self.interval_spinbox.setSuffix(" ms")
+        self.interval_spinbox.setToolTip("Polling interval in milliseconds (500-10000, default 5000)")
+        self.interval_spinbox.valueChanged.connect(self.on_auto_capture_interval_changed)
+
+        self.sensitivity_slider = QSlider(Qt.Horizontal)
+        self.sensitivity_slider.setRange(1, 50)
+        self.sensitivity_slider.setValue(self.cfg.get("auto_capture_threshold", 15))
+        self.sensitivity_slider.setToolTip("Sensitivity threshold (1=most sensitive, 50=least sensitive, default 15)")
+        self.sensitivity_slider.setMaximumWidth(100)
+        self.sensitivity_slider.valueChanged.connect(self.on_auto_capture_sensitivity_changed)
+
+        self.sensitivity_label = QLabel(f"Sensitivity: {self.sensitivity_slider.value()}")
+        self.sensitivity_label.setMinimumWidth(80)
+
+        self.auto_status_label = QLabel("\u25cf Idle")
+        self.auto_status_label.setStyleSheet("color: #888;")
+        self.auto_status_label.setToolTip("Auto-capture monitoring status")
+
+        self.auto_capture_count_label = QLabel("0 auto-caps")
+        self.auto_capture_count_label.setStyleSheet("color: #555;")
+
+        # === SESSION PANEL WIDGETS ===
+        # Session header label
+        self.session_label = QLabel("SESSION: No captures yet")
+        self.session_label.setStyleSheet("font-weight: bold; font-size: 12px; color: #333;")
+
+        # Session action buttons (in header)
+        self.btn_discard = QPushButton("Discard")
+        self.btn_discard.setToolTip("Discard all captured frames in the current session")
+        self.btn_discard.setVisible(False)
+        self.btn_discard.clicked.connect(self.discard_selected_frame)
+
+        self.btn_session_open_folder = QPushButton("Open Folder")
+        self.btn_session_open_folder.setToolTip("Open the session folder in Explorer")
+        self.btn_session_open_folder.clicked.connect(self.open_session_folder)
+
+        # Step cards
+        self.step1_card = StepCard(
+            1, "\U0001F4CA", "Create PPT",
+            "Crop images and create PowerPoint presentation"
+        )
+        self.step1_card.clicked.connect(self._on_step1_clicked)
+
+        self.step2_card = StepCard(
+            2, "\U0001F916", "Extract with AI",
+            "Send images to LLM for text extraction → HTML document"
+        )
+        self.step2_card.clicked.connect(self._on_step2_clicked)
+
+        # Empty state message
+        self.empty_state_label = QLabel(
+            "Use hotkey or enable auto-capture to begin capturing frames"
+        )
+        self.empty_state_label.setStyleSheet("color: #888; font-style: italic; padding: 20px;")
+        self.empty_state_label.setAlignment(Qt.AlignCenter)
+
+        # === COLLAPSIBLE "PROCESS EXISTING FILES" SECTION ===
+        self.btn_toggle_existing = QPushButton("\u25B6 Process Existing Files")
+        self.btn_toggle_existing.setStyleSheet("text-align: left; padding: 5px 10px; font-weight: bold;")
+        self.btn_toggle_existing.setFlat(True)
+        self.btn_toggle_existing.clicked.connect(self._toggle_existing_files)
+
+        self.existing_files_container = QWidget()
+        self.existing_files_container.setVisible(False)
+
+        # Buttons for existing files (renamed from old buttons)
+        self.btn_ppt_from_folder = QPushButton("\U0001F4CA PPT from Folder")
+        self.btn_ppt_from_folder.setToolTip("Select a folder of images, crop them, create PowerPoint")
+        self.btn_ppt_from_folder.clicked.connect(self.create_ppt_from_folder)
+
+        self.btn_ai_from_files = QPushButton("\U0001F916 AI Extract from Files")
+        self.btn_ai_from_files.setToolTip("Select images and extract content using AI")
+        self.btn_ai_from_files.clicked.connect(self.process_images_mode)
+
+        # Legacy aliases for compatibility (hidden)
+        self.btn_create_ppt = self.btn_ppt_from_folder
+        self.btn_mode_a = self.btn_ai_from_files
+        self.btn_complete_ppt = QPushButton()  # Hidden placeholder
         self.btn_complete_ppt.setVisible(False)
-        self.btn_complete_ppt.setToolTip("Create PPT from captured frames")
-        self.btn_complete_ppt.clicked.connect(self.complete_ppt_from_captures)
+        self.btn_complete = QPushButton()  # Hidden placeholder
+        self.btn_complete.setVisible(False)
 
         # Status labels
         self.status_label = QLabel("Ready.")
         self.status_label.setWordWrap(True)
-        self.queue_label = QLabel("Captured: 0 frames")
-        self.queue_label.setStyleSheet("color:#555;")
+        self.queue_label = QLabel("")  # Now hidden, replaced by session_label
+        self.queue_label.setVisible(False)
         self.flash_label = QLabel("")
         self.flash_label.setStyleSheet("padding:4px 8px; color:#fff; background:#2e7d32; border-radius:6px;")
         self.flash_label.setVisible(False)
@@ -1226,15 +1870,6 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setVisible(False)
         self.btn_cancel.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
         self.btn_cancel.clicked.connect(self.cancel_processing)
-
-        # === AI ACTION BUTTONS (in main section) ===
-        self.btn_mode_a = QPushButton("Process Saved Images")
-        self.btn_mode_a.setToolTip("Select images and extract content using AI")
-        self.btn_mode_a.clicked.connect(self.process_images_mode)
-
-        self.btn_complete = QPushButton("Complete & Save HTML")
-        self.btn_complete.setVisible(False)
-        self.btn_complete.clicked.connect(self.complete_and_save)
 
         # === COLLAPSIBLE AI SETTINGS (toggle button + hidden container) ===
         self.btn_toggle_ai = QPushButton("▶ AI Settings")
@@ -1303,14 +1938,17 @@ class MainWindow(QMainWindow):
         root = QWidget()
         v = QVBoxLayout(root)
 
-        # Hotkey row
-        hotkey_row = QHBoxLayout()
-        hotkey_row.addWidget(QLabel("Hotkey:"))
-        hotkey_row.addWidget(self.hotkey_edit)
-        hotkey_row.addWidget(self.btn_rebind_hotkey)
-        hotkey_row.addWidget(self.hotkey_enabled_checkbox)
-        hotkey_row.addStretch()
-        v.addLayout(hotkey_row)
+        # Hotkeys row (both hotkeys on one line)
+        hotkeys_row = QHBoxLayout()
+        hotkeys_row.addWidget(QLabel("Capture hotkey:"))
+        hotkeys_row.addWidget(self.manual_hotkey_edit)
+        hotkeys_row.addWidget(self.btn_rebind_manual_hotkey)
+        hotkeys_row.addSpacing(20)
+        hotkeys_row.addWidget(QLabel("Auto-capture hotkey:"))
+        hotkeys_row.addWidget(self.auto_hotkey_edit)
+        hotkeys_row.addWidget(self.btn_rebind_auto_hotkey)
+        hotkeys_row.addStretch()
+        v.addLayout(hotkeys_row)
 
         # Folder row
         folder_row = QHBoxLayout()
@@ -1320,15 +1958,59 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(self.btn_open_folder)
         v.addLayout(folder_row)
 
-        # Main actions row
-        main_actions = QHBoxLayout()
-        main_actions.addWidget(self.btn_create_ppt)
-        main_actions.addWidget(self.btn_mode_a)
-        main_actions.addWidget(self.btn_complete)
-        main_actions.addStretch()
-        main_actions.addWidget(self.queue_label)
-        main_actions.addWidget(self.btn_complete_ppt)
-        v.addLayout(main_actions)
+        # Auto-capture row
+        auto_row = QHBoxLayout()
+        auto_row.addWidget(self.auto_capture_checkbox)
+        auto_row.addWidget(QLabel("Interval:"))
+        auto_row.addWidget(self.interval_spinbox)
+        auto_row.addWidget(self.sensitivity_label)
+        auto_row.addWidget(self.sensitivity_slider)
+        auto_row.addStretch()
+        auto_row.addWidget(self.auto_status_label)
+        auto_row.addWidget(self.auto_capture_count_label)
+        v.addLayout(auto_row)
+
+        # === SESSION PANEL ===
+        session_frame = QFrame()
+        session_frame.setFrameStyle(QFrame.StyledPanel)
+        session_frame.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+                padding: 8px;
+            }
+        """)
+        session_layout = QVBoxLayout(session_frame)
+        session_layout.setSpacing(12)
+
+        # Session header row
+        session_header = QHBoxLayout()
+        session_header.addWidget(self.session_label)
+        session_header.addStretch()
+        session_header.addWidget(self.btn_discard)
+        session_header.addWidget(self.btn_session_open_folder)
+        session_layout.addLayout(session_header)
+
+        # Empty state (shown when no captures)
+        session_layout.addWidget(self.empty_state_label)
+
+        # Step cards
+        session_layout.addWidget(self.step1_card)
+        session_layout.addWidget(self.step2_card)
+
+        v.addWidget(session_frame)
+
+        # === COLLAPSIBLE "PROCESS EXISTING FILES" SECTION ===
+        v.addWidget(self.btn_toggle_existing)
+
+        # Container for existing files buttons
+        existing_layout = QHBoxLayout(self.existing_files_container)
+        existing_layout.setContentsMargins(20, 5, 5, 10)
+        existing_layout.addWidget(self.btn_ppt_from_folder)
+        existing_layout.addWidget(self.btn_ai_from_files)
+        existing_layout.addStretch()
+        v.addWidget(self.existing_files_container)
 
         # Collapsible AI settings toggle
         v.addWidget(self.btn_toggle_ai)
@@ -1386,7 +2068,6 @@ class MainWindow(QMainWindow):
         v.addStretch()
 
         self.setCentralWidget(root)
-        self.add_discard_button()
 
         # Tray icon
         self.tray = QSystemTrayIcon(self)
@@ -1396,14 +2077,17 @@ class MainWindow(QMainWindow):
         tray_menu = QMenu()
         act_show = QAction("Show", self)
         act_show.triggered.connect(lambda: (self.showNormal(), self.raise_(), self.activateWindow()))
-        act_snap = QAction("Snap Frame (active window)", self)
-        act_snap.triggered.connect(self.on_hotkey_pressed)
+        self.act_toggle_auto = QAction("Start Auto-capture", self)
+        self.act_toggle_auto.triggered.connect(self.toggle_auto_capture)
+        act_snap = QAction("Snap Single Frame", self)
+        act_snap.triggered.connect(self.manual_capture)
         act_complete = QAction("Complete & Save…", self)
         act_complete.triggered.connect(self.complete_and_save)
         act_quit = QAction("Quit", self)
         act_quit.triggered.connect(QApplication.instance().quit)
         tray_menu.addAction(act_show)
         tray_menu.addSeparator()
+        tray_menu.addAction(self.act_toggle_auto)
         tray_menu.addAction(act_snap)
         tray_menu.addAction(act_complete)
         tray_menu.addSeparator()
@@ -1411,10 +2095,16 @@ class MainWindow(QMainWindow):
         self.tray.setContextMenu(tray_menu)
         self.tray.show()
 
-        # Hotkey listener (optional, based on toggle)
-        self.hotkey_listener: HotkeyListener | None = None
-        if self.hotkey_enabled_checkbox.isChecked():
-            self.start_hotkey_listener()
+        # Setup hotkeys (no threads, just register with keyboard library)
+        manual_hk = self.cfg.get("manual_capture_hotkey", "ctrl+alt+p")
+        auto_hk = self.cfg.get("auto_capture_hotkey", "ctrl+alt+r")
+        print(f"[DEBUG] Setting up hotkeys: manual={manual_hk}, auto={auto_hk}")
+        self.hotkey_manager.set_manual_hotkey(manual_hk)
+        self.hotkey_manager.set_auto_hotkey(auto_hk)
+        print("[DEBUG] Hotkeys registered")
+        self.status_update(f"Hotkeys: capture={manual_hk}, auto-toggle={auto_hk}")
+
+        # Note: Auto-capture always starts DISABLED. User must check the box or press hotkey.
 
         # Populate models
         self.refresh_models()
@@ -1444,6 +2134,7 @@ class MainWindow(QMainWindow):
 
         self.status_update(f"Ready. (Hotkey: {self.cfg.get('hotkey', DEFAULT_HOTKEY)})")
         self.update_queue_state()
+        self.update_session_ui()
 
     # --------------------------- Endpoint & AI Client helpers ---------------------------
 
@@ -1474,9 +2165,104 @@ class MainWindow(QMainWindow):
         is_visible = self.ai_settings_container.isVisible()
         self.ai_settings_container.setVisible(not is_visible)
         if is_visible:
-            self.btn_toggle_ai.setText("▶ AI Settings")
+            self.btn_toggle_ai.setText("\u25B6 AI Settings")
         else:
-            self.btn_toggle_ai.setText("▼ AI Settings")
+            self.btn_toggle_ai.setText("\u25BC AI Settings")
+
+    def _toggle_existing_files(self):
+        """Toggle visibility of 'Process Existing Files' section."""
+        is_visible = self.existing_files_container.isVisible()
+        self.existing_files_container.setVisible(not is_visible)
+        if is_visible:
+            self.btn_toggle_existing.setText("\u25B6 Process Existing Files")
+        else:
+            self.btn_toggle_existing.setText("\u25BC Process Existing Files")
+
+    def update_session_ui(self):
+        """Update session panel based on current state."""
+        # Count captures
+        captures = len(self.deferred_queue)
+        has_captures = captures > 0
+
+        # Also check for images in current session folder
+        session_images = 0
+        if self.current_session_folder and self.current_session_folder.exists():
+            session_images = len(list(self.current_session_folder.glob("*_capture.png")))
+            if session_images > captures:
+                captures = session_images
+                has_captures = True
+
+        # Update session header
+        if has_captures:
+            status_parts = [f"{captures} frames captured"]
+            if self.session_state["ppt_created"]:
+                status_parts.append("PPT \u2713")
+            if self.session_state["ai_extracted"]:
+                status_parts.append("AI \u2713")
+            self.session_label.setText("SESSION: " + " \u2192 ".join(status_parts))
+        else:
+            self.session_label.setText("SESSION: No captures yet")
+
+        # Show/hide empty state vs step cards
+        self.empty_state_label.setVisible(not has_captures)
+        self.step1_card.setVisible(has_captures)
+        self.step2_card.setVisible(has_captures)
+        self.btn_discard.setVisible(has_captures)
+
+        # Update Step 1 (Create PPT)
+        if self.session_state["ppt_created"]:
+            self.step1_card.set_status("\u2713 Complete", self.session_state["ppt_path"] or "")
+            self.step1_card.set_button_text("Open PPT")
+            self.step1_card.set_button_style("success")
+        else:
+            self.step1_card.set_status(f"{captures} images ready" if has_captures else "No images")
+            self.step1_card.set_button_text("Create PPT")
+            self.step1_card.set_button_style("primary")
+        self.step1_card.setEnabled(has_captures)
+
+        # Update Step 2 (Extract with AI)
+        if self.session_state["ai_extracted"]:
+            self.step2_card.set_status("\u2713 Complete", self.session_state["html_path"] or "")
+            self.step2_card.set_button_text("Open HTML")
+            self.step2_card.set_button_style("success")
+        elif self.session_state["ppt_created"] and self.session_state["cropped_images"]:
+            cropped = len(self.session_state["cropped_images"])
+            self.step2_card.set_status(f"{cropped} cropped images ready (recommended)")
+            self.step2_card.set_button_text("Extract")
+            self.step2_card.set_button_style("primary")
+        elif has_captures:
+            self.step2_card.set_status(f"{captures} raw images (crop first for better results)")
+            self.step2_card.set_button_text("Extract")
+            self.step2_card.set_button_style("secondary")
+        else:
+            self.step2_card.set_status("No images")
+            self.step2_card.set_button_text("Extract")
+            self.step2_card.set_button_style("secondary")
+        self.step2_card.setEnabled(has_captures)
+
+    def _on_step1_clicked(self):
+        """Handle click on Step 1 card (Create PPT)."""
+        if self.session_state["ppt_created"] and self.session_state["ppt_path"]:
+            # Open the existing PPT
+            try:
+                os.startfile(self.session_state["ppt_path"])
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not open PPT:\n{e}")
+        else:
+            # Create PPT from captures
+            self.complete_ppt_from_captures()
+
+    def _on_step2_clicked(self):
+        """Handle click on Step 2 card (Extract with AI)."""
+        if self.session_state["ai_extracted"] and self.session_state["html_path"]:
+            # Open the existing HTML
+            try:
+                os.startfile(self.session_state["html_path"])
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not open HTML:\n{e}")
+        else:
+            # Extract with AI
+            self.complete_and_save()
 
     def _parse_model_string(self, model_str: str) -> tuple[str, str]:
         """Parse 'Endpoint: model' string into (endpoint_name, model_name)."""
@@ -1610,11 +2396,20 @@ class MainWindow(QMainWindow):
 
     def _process_images_with_crop_dialog(self, image_files: list[Path]) -> list[Image.Image] | None:
         """
-        Show crop dialog for first image, then process all images with selected crop mode.
+        Show slide review dialog (for deleting duplicates), then crop dialog.
         Returns list of processed PIL images, or None if user cancels.
         """
         if not image_files:
             return None
+
+        # Show slide review dialog first if there are multiple images
+        if len(image_files) > 1:
+            review_dialog = SlideReviewDialog(image_files, self)
+            if review_dialog.exec() != QDialog.Accepted:
+                return None
+            image_files = review_dialog.get_remaining_paths()
+            if not image_files:
+                return None
 
         # Open first image to get crop settings
         first_img = Image.open(image_files[0])
@@ -1719,6 +2514,20 @@ class MainWindow(QMainWindow):
         if out_path:
             prs.save(out_path)
             self.status_update(f"Saved: {out_path}")
+
+            # Save cropped images to session folder for AI extraction step
+            cropped_paths = []
+            for i, img in enumerate(cropped_images):
+                cropped_path = self.current_session_folder / f"cropped_{i:03d}.png"
+                img.save(cropped_path, format="PNG")
+                cropped_paths.append(str(cropped_path))
+
+            # Update session state
+            self.session_state["ppt_created"] = True
+            self.session_state["ppt_path"] = out_path
+            self.session_state["cropped_images"] = cropped_paths
+            self.update_session_ui()
+
             QMessageBox.information(self, "PPT Created", f"PowerPoint saved with {len(cropped_images)} slides.")
         else:
             self.status_update("Save canceled.")
@@ -1801,6 +2610,14 @@ class MainWindow(QMainWindow):
     def reset_session(self):
         """Reset the session folder (start fresh for next capture batch)."""
         self.current_session_folder = None
+        # Also reset session state
+        self.session_state = {
+            "ppt_created": False,
+            "ppt_path": None,
+            "cropped_images": [],
+            "ai_extracted": False,
+            "html_path": None,
+        }
 
     def _apply_teams_crop(self, img: Image.Image) -> Image.Image | None:
         """
@@ -1834,7 +2651,22 @@ class MainWindow(QMainWindow):
             # Dialog was closed/cancelled - return original
             return img
 
-    def flash_ping(self, text="Captured frame"):
+    def flash_ping(self, text="Captured frame", source="manual"):
+        """Visual feedback for capture with color coding.
+
+        Args:
+            text: Message to display
+            source: "manual" for green (hotkey), "auto" for blue (slide detection)
+        """
+        if source == "manual":
+            color = "#2e7d32"  # Green - manual capture
+        else:  # auto
+            color = "#1976d2"  # Blue - auto capture
+
+        self.flash_label.setStyleSheet(
+            f"padding: 4px 8px; background-color: {color}; "
+            f"color: white; border-radius: 6px; font-weight: bold;"
+        )
         self.flash_label.setText(text)
         self.flash_label.setVisible(True)
         self.tray.showMessage(APP_NAME, text, QSystemTrayIcon.Information, 1200)
@@ -1843,14 +2675,18 @@ class MainWindow(QMainWindow):
     def save_current_config(self):
         self.cfg["extraction_prompt"] = self.prompt_extract.toPlainText().strip() or DEFAULT_EXTRACTION_PROMPT
         self.cfg["summary_prompt"] = self.prompt_summary.toPlainText().strip() or DEFAULT_SUMMARY_PROMPT
-        self.cfg["hotkey"] = self.hotkey_edit.text().strip() or DEFAULT_HOTKEY
-        self.cfg["hotkey_enabled"] = self.hotkey_enabled_checkbox.isChecked()
+        self.cfg["manual_capture_hotkey"] = self.manual_hotkey_edit.text().strip() or "ctrl+alt+p"
+        self.cfg["auto_capture_hotkey"] = self.auto_hotkey_edit.text().strip() or "ctrl+alt+r"
         self.cfg["defer_processing"] = self.defer_checkbox.isChecked()
         self.cfg["extraction_model"] = self.model_extract.currentText().strip()
         self.cfg["summary_model"] = self.model_summary.currentText().strip()
         self.cfg["extraction_source"] = "cloud" if self.radio_extract_cloud.isChecked() else "local"
         self.cfg["summary_source"] = "cloud" if self.radio_summary_cloud.isChecked() else "local"
         self.cfg["include_summary"] = self.include_summary_checkbox.isChecked()
+        # Auto-capture settings
+        self.cfg["auto_capture_enabled"] = self.auto_capture_checkbox.isChecked()
+        self.cfg["auto_capture_interval_sec"] = self.interval_spinbox.value() / 1000.0
+        self.cfg["auto_capture_threshold"] = self.sensitivity_slider.value()
         save_config(self.cfg)
 
     def update_queue_state(self):
@@ -1998,6 +2834,15 @@ class MainWindow(QMainWindow):
 
         files.sort(key=lambda p: os.path.getctime(p))
         file_paths = [Path(f) for f in files]
+
+        # Show slide review dialog first if there are multiple images
+        if len(file_paths) > 1:
+            review_dialog = SlideReviewDialog(file_paths, self)
+            if review_dialog.exec() != QDialog.Accepted:
+                return
+            file_paths = review_dialog.get_remaining_paths()
+            if not file_paths:
+                return
 
         # Ask for project folder to save processed images
         project_folder = QFileDialog.getExistingDirectory(
@@ -2172,7 +3017,7 @@ class MainWindow(QMainWindow):
         self.save_word_html_via_dialog(final_html)
         self.status_update("Ready.")
 
-    def save_word_html_via_dialog(self, html_text: str):
+    def save_word_html_via_dialog(self, html_text: str) -> str | None:
         default_name = datetime.now().strftime("%Y%m%d_%H%M_run-summary.doc")
         # Default to session folder if it exists, otherwise use home directory
         if self.current_session_folder and self.current_session_folder.exists():
@@ -2188,8 +3033,14 @@ class MainWindow(QMainWindow):
         if out_path:
             Path(out_path).write_text(html_text, encoding="utf-8")
             self.status_update(f"Saved: {out_path}")
+            # Update session state
+            self.session_state["ai_extracted"] = True
+            self.session_state["html_path"] = out_path
+            self.update_session_ui()
+            return out_path
         else:
             self.status_update("Save canceled.")
+            return None
 
     # --------------------------- PPT Mode ---------------------------
 
@@ -2305,10 +3156,10 @@ class MainWindow(QMainWindow):
 
         return prs
 
-    # --------------------------- Mode B (updated: snap once per hotkey) ---------------------------
+    # --------------------------- Manual Capture ---------------------------
 
-    def on_hotkey_pressed(self):
-        """Capture active window once. Depending on 'defer', either queue raw image or extract now."""
+    def manual_capture(self):
+        """Capture active window once (manual capture, not tied to hotkey)."""
         try:
             (l, t, r, b), hwnd = get_active_window_bbox()
             bbox = (l, t, r, b)
@@ -2354,6 +3205,7 @@ class MainWindow(QMainWindow):
                 self.deferred_queue.append((when, png_bytes))
             self.status_update(f"Queued frame at {when} (deferred)")
             self.update_queue_state()
+            self.update_session_ui()
         else:
             # Process immediately in background; store the section HTML for later summary
             self._pending_operation = "immediate"
@@ -2378,6 +3230,7 @@ class MainWindow(QMainWindow):
         self.status_update(f"Processed frame at {self._pending_timestamp} (immediate)")
         self._pending_timestamp = None
         self.update_queue_state()
+        self.update_session_ui()
 
     def complete_and_save(self):
         """Process any queued frames (if deferred), then summarize ALL processed sections and save."""
@@ -2400,15 +3253,37 @@ class MainWindow(QMainWindow):
         include_summary = self.include_summary_checkbox.isChecked()
 
         # Check if we have anything to process
+        # Prefer cropped images from PPT step if available
+        has_cropped = bool(self.session_state.get("cropped_images"))
         has_queued = self.defer_checkbox.isChecked() and len(self.deferred_queue) > 0
         has_processed = len(self.processed_sections_html) > 0
 
-        if not has_queued and not has_processed:
+        if not has_cropped and not has_queued and not has_processed:
             QMessageBox.information(self, "Nothing to do", "No frames have been captured yet.")
             return
 
-        # If we have queued frames, process them with the worker
-        if has_queued:
+        # Prefer cropped images (from PPT step) over raw queued frames
+        if has_cropped:
+            cropped_paths = self.session_state["cropped_images"]
+            image_count = len(cropped_paths)
+            total_steps = image_count + (1 if include_summary else 0)
+
+            self._pending_operation = "mode_b"
+            self.progress_start(f"Processing {image_count} cropped images...", total_steps)
+            self.status_update(f"Processing {image_count} cropped images…")
+
+            self.worker = ProcessingWorker(self)
+            self.worker.setup_extract_images(
+                extract_client, cropped_paths, extract_model, extraction_prompt,
+                summary_model, summary_prompt, include_summary, image_type="path"
+            )
+            self.worker.progress.connect(self._on_worker_progress)
+            self.worker.status.connect(self._on_worker_status)
+            self.worker.finished_ok.connect(self._on_mode_b_finished)
+            self.worker.finished_error.connect(self._on_worker_error)
+            self.worker.start()
+        elif has_queued:
+            # Fall back to queued raw frames
             queued_count = len(self.deferred_queue)
             total_steps = queued_count + (1 if include_summary else 0)
 
@@ -2568,61 +3443,190 @@ class MainWindow(QMainWindow):
         self._pending_html = None
         self.processed_sections_html.clear()
         self.deferred_queue.clear()
-        self.reset_session()
+        # Note: We don't reset_session() here so the session panel shows completion status
+        # The user can discard to reset, or start a new capture session
         self.update_queue_state()
+        self.update_session_ui()
         self.status_update("Ready.")
 
     # --------------------------- Toggles & bindings ---------------------------
 
-    def rebind_hotkey(self):
+    def rebind_auto_capture_hotkey(self):
+        """Allow user to change the auto-capture toggle hotkey."""
         from PySide6.QtWidgets import QInputDialog
-        hk, ok = QInputDialog.getText(self, "Bind Hotkey", "Enter new hotkey (e.g. ctrl+alt+p) or press Esc to cancel:", text=self.hotkey_edit.text())
+        hk, ok = QInputDialog.getText(
+            self, "Bind Auto-capture Hotkey",
+            "Enter new hotkey (e.g. ctrl+alt+r) or press Esc to cancel:",
+            text=self.auto_hotkey_edit.text()
+        )
         if ok and hk.strip():
-            self.hotkey_edit.setText(hk.strip())
-            self.hotkey_listener.rebind(hk.strip())
-            self.cfg["hotkey"] = hk.strip()
+            self.auto_hotkey_edit.setText(hk.strip())
+            self.cfg["auto_capture_hotkey"] = hk.strip()
             save_config(self.cfg)
-            self.status_update(f"Global hotkey bound to: {hk.strip()}")
+            self.hotkey_manager.set_auto_hotkey(hk.strip())
+            self.status_update(f"Auto-capture hotkey bound to: {hk.strip()}")
         else:
             self.status_update("Hotkey binding canceled.")
 
-    def start_hotkey_listener(self):
-        try:
-            if self.hotkey_listener:
-                self.hotkey_listener.stop()
-            self.hotkey_listener = HotkeyListener(self.cfg.get("hotkey", DEFAULT_HOTKEY))
-            self.hotkey_listener.pressed.connect(self.on_hotkey_pressed)
-            self.hotkey_listener.start()
-            self.status_update(f"Hotkey enabled ({self.cfg.get('hotkey', DEFAULT_HOTKEY)})")
-        except Exception:
-            # non-fatal; user can still click "Snap Now"
-            self.status_update("Hotkey could not be enabled (permissions?).")
-
-    def stop_hotkey_listener(self):
-        try:
-            if self.hotkey_listener:
-                self.hotkey_listener.stop()
-                self.hotkey_listener = None
-        except Exception:
-            pass
-        self.status_update("Hotkey disabled")
-
-    def on_hotkey_enabled_changed(self, state):
-        enabled = state == Qt.Checked
-        if enabled:
-            self.start_hotkey_listener()
+    def rebind_manual_capture_hotkey(self):
+        """Allow user to change the manual capture hotkey."""
+        from PySide6.QtWidgets import QInputDialog
+        hk, ok = QInputDialog.getText(
+            self, "Bind Manual Capture Hotkey",
+            "Enter new hotkey (e.g. ctrl+alt+p) or press Esc to cancel:",
+            text=self.manual_hotkey_edit.text()
+        )
+        if ok and hk.strip():
+            self.manual_hotkey_edit.setText(hk.strip())
+            self.cfg["manual_capture_hotkey"] = hk.strip()
+            save_config(self.cfg)
+            self.hotkey_manager.set_manual_hotkey(hk.strip())
+            self.status_update(f"Manual capture hotkey bound to: {hk.strip()}")
         else:
-            self.stop_hotkey_listener()
-        self.save_current_config()
+            self.status_update("Hotkey binding canceled.")
+
+    def toggle_auto_capture(self):
+        """Toggle auto-capture on/off (called by hotkey)."""
+        print("[DEBUG] toggle_auto_capture called")
+        is_running = self.auto_capture_worker is not None and self.auto_capture_worker.isRunning()
+        print(f"[DEBUG] Auto-capture is_running: {is_running}")
+        if is_running:
+            self.auto_capture_checkbox.setChecked(False)  # This triggers stop_auto_capture
+        else:
+            self.auto_capture_checkbox.setChecked(True)  # This triggers start_auto_capture
 
     def on_defer_changed(self, state):
         # Just persist. Queue semantics handled at snap/complete time.
         self.save_current_config()
         self.update_queue_state()
+        self.update_session_ui()
 
     def on_include_summary_changed(self, state):
         self.cfg["include_summary"] = bool(state == Qt.Checked)
         save_config(self.cfg)
+
+    # --------------------------- Auto-capture ---------------------------
+
+    def on_auto_capture_changed(self, state):
+        """Handle auto-capture checkbox toggle."""
+        print(f"[DEBUG] on_auto_capture_changed called, state={state}")
+        # state is an int (0=unchecked, 2=checked), not the enum directly
+        enabled = (state == 2)
+        print(f"[DEBUG] enabled={enabled}")
+        if enabled:
+            print("[DEBUG] Calling start_auto_capture...")
+            self.start_auto_capture()
+        else:
+            print("[DEBUG] Calling stop_auto_capture...")
+            self.stop_auto_capture()
+        self.save_current_config()
+
+    def on_auto_capture_interval_changed(self, value):
+        """Handle interval spinbox change."""
+        self.save_current_config()
+        # Update the worker if running
+        if self.auto_capture_worker and self.auto_capture_worker.isRunning():
+            self.auto_capture_worker.interval_sec = value / 1000.0
+
+    def on_auto_capture_sensitivity_changed(self, value):
+        """Handle sensitivity slider change."""
+        self.sensitivity_label.setText(f"Sensitivity: {value}")
+        self.save_current_config()
+        # Update the detector if active
+        if self.slide_detector:
+            self.slide_detector.threshold = value
+
+    def start_auto_capture(self):
+        """Start the auto-capture monitoring thread."""
+        print("[DEBUG] start_auto_capture called")
+        threshold = self.sensitivity_slider.value()
+        interval = self.interval_spinbox.value() / 1000.0
+        print(f"[DEBUG] threshold={threshold}, interval={interval}")
+
+        self.slide_detector = SlideChangeDetector(threshold=threshold)
+        self.auto_capture_worker = AutoCaptureWorker(self.slide_detector, interval, self)
+        self.auto_capture_worker.frame_captured.connect(self.on_auto_frame_captured)
+        self.auto_capture_worker.status_update.connect(self.status_update)
+        self.auto_capture_worker.error.connect(self.on_auto_capture_error)
+        self.auto_capture_worker.start()
+        print("[DEBUG] Auto-capture worker started")
+
+        # Show floating overlay at top of screen
+        print("[DEBUG] Creating/showing recording overlay...")
+        if not self.recording_overlay:
+            self.recording_overlay = RecordingOverlay()
+        hotkey = self.auto_hotkey_edit.text()
+        self.recording_overlay.label.setText(f"\U0001F534 RECORDING - Press {hotkey} to stop")
+        self.recording_overlay.adjustSize()
+        self.recording_overlay.showAtTop()
+        print("[DEBUG] Recording overlay shown")
+
+        # Update UI to show auto-capture is active
+        self.auto_status_label.setText("\U0001F534 RECORDING")
+        self.auto_status_label.setStyleSheet("color: #c62828; font-weight: bold; font-size: 12px;")
+        self.setWindowTitle(f"{APP_NAME} - \U0001F534 AUTO-CAPTURE ACTIVE")
+        self.act_toggle_auto.setText("Stop Auto-capture")
+        self.tray.setToolTip(f"{APP_NAME} - AUTO-CAPTURE ACTIVE")
+        self.status_update("Auto-capture started - switch to target window!")
+
+    def stop_auto_capture(self):
+        """Stop the auto-capture monitoring thread."""
+        if self.auto_capture_worker:
+            self.auto_capture_worker.stop()
+            self.auto_capture_worker = None
+        self.slide_detector = None
+
+        # Hide the overlay
+        if self.recording_overlay:
+            self.recording_overlay.hide()
+
+        # Update UI to show auto-capture is stopped
+        self.auto_status_label.setText("\u25cf Idle")
+        self.auto_status_label.setStyleSheet("color: #888;")
+        self.setWindowTitle(APP_NAME)
+        self.act_toggle_auto.setText("Start Auto-capture")
+        self.tray.setToolTip(APP_NAME)
+        self.status_update("Auto-capture stopped")
+
+    def on_auto_frame_captured(self, pil_image: Image.Image, source: str):
+        """Handle frame captured by auto-detect worker."""
+        self.auto_capture_count += 1
+        self.auto_capture_count_label.setText(f"{self.auto_capture_count} auto-caps")
+        self._save_captured_frame(pil_image, source)
+        self.flash_ping(f"Auto-captured slide #{self.auto_capture_count}", source="auto")
+
+    def on_auto_capture_error(self, error_msg: str):
+        """Handle error from auto-capture worker."""
+        # Don't spam errors - just log to status
+        self.status_update(f"Auto-capture error: {error_msg}")
+
+    def _save_captured_frame(self, pil_image: Image.Image, source: str):
+        """Common logic for saving a captured frame (from manual or auto capture)."""
+        from io import BytesIO
+
+        buf = BytesIO()
+        pil_image.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+        when = human_ts()
+
+        # Save interim PNG to session subfolder
+        try:
+            session_folder = self.get_or_create_session_folder()
+            fname = session_folder / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{source}.png"
+            Path(fname).write_bytes(png_bytes)
+            self.status_update(f"Captured: {fname.name} (in {session_folder.name})")
+        except Exception:
+            fname = None
+
+        # Queue for deferred processing
+        if self.defer_checkbox.isChecked():
+            stored_path = str(fname) if fname else ""
+            if stored_path:
+                self.deferred_queue.append((when, png_bytes, stored_path))
+            else:
+                self.deferred_queue.append((when, png_bytes))
+            self.update_queue_state()
+            self.update_session_ui()
 
     # --------------------------- Lifecycle ---------------------------
 
@@ -2643,9 +3647,16 @@ class MainWindow(QMainWindow):
 
         self.save_current_config()
         try:
-            self.stop_hotkey_listener()
+            self.hotkey_manager.cleanup()
         except Exception:
             pass
+        try:
+            self.stop_auto_capture()
+        except Exception:
+            pass
+        # Close overlay if open
+        if self.recording_overlay:
+            self.recording_overlay.close()
         return super().closeEvent(event)
 
     def save_extraction_prompt(self):
@@ -2671,15 +3682,6 @@ class MainWindow(QMainWindow):
         self.cfg["summary_prompt"] = DEFAULT_SUMMARY_PROMPT
         save_config(self.cfg)
         self.status_update("Summary prompt restored to default.")
-
-    def add_discard_button(self):
-        self.btn_discard = QPushButton("Discard Session")
-        self.btn_discard.setVisible(False)
-        self.btn_discard.setToolTip("Discard all captured frames in the current session and delete their PNG files.\n"
-                                    "Previous session folders are preserved for recovery via 'Process Saved Images'.")
-        self.btn_discard.clicked.connect(self.discard_selected_frame)
-        # Add to layout after queue_label
-        self.centralWidget().layout().insertWidget(self.centralWidget().layout().indexOf(self.queue_label) + 1, self.btn_discard)
 
     def discard_selected_frame(self):
         # Discard ALL frames: clear both queued raw frames and any processed sections.
@@ -2707,14 +3709,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Reset session
+        # Reset session (also resets session_state)
         self.reset_session()
 
         # Force the UI into the empty state immediately
         try:
             self.queue_label.setText("No outstanding frames to process")
             self.btn_complete.setVisible(False)
-            self.btn_discard.setVisible(False)
+            self.update_session_ui()
             QApplication.processEvents()
         except Exception:
             pass
